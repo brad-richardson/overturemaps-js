@@ -55,10 +55,10 @@ import { createWriteStream } from 'fs';
 import { createGzip } from 'zlib';
 
 const client = new OvertureClient();
-const output = createWriteStream('roads.geojson.gz').pipe(createGzip());
+const output = createGzip().pipe(createWriteStream('transportation.geojson.gz'));
 
 await client.download({
-  type: 'transportation',
+  type: 'transportation', // Transportation includes roads, paths, and other infrastructure
   bbox: { west: -122.5, south: 37.7, east: -122.3, north: 37.9 },
   format: 'geojsonseq',
   output
@@ -72,7 +72,7 @@ import { OvertureClient } from '@brad/overturemaps';
 const client = new OvertureClient();
 
 // Get a specific feature by GERS ID
-const feature = await client.getFeatureByGERS('08f...');
+const feature = await client.getFeatureByGERS('08f1a4a7-5a6b-4c3d-9e2f-1a2b3c4d5e6f');
 if (feature) {
   console.log(feature.properties);
 }

@@ -16,14 +16,14 @@ This document outlines the implementation roadmap for the @brad/overturemaps lib
 
 ## Phase 2: Core Data Structures
 
-- [ ] Define TypeScript interfaces for data types
-  - [ ] `BoundingBox` interface
-  - [ ] `DataType` enum/union type
-  - [ ] `OutputFormat` enum/union type
-  - [ ] `Feature` interface (GeoJSON Feature)
-  - [ ] `DownloadOptions` interface
-  - [ ] `ClientOptions` interface
-  - [ ] `StreamOptions` interface
+- [x] Define TypeScript interfaces for data types
+  - [x] `BoundingBox` interface
+  - [x] `DataType` enum/union type
+  - [x] `OutputFormat` enum/union type
+  - [x] `Feature` interface (GeoJSON Feature)
+  - [x] `DownloadOptions` interface
+  - [x] `ClientOptions` interface
+  - [x] `StreamOptions` interface
 - [ ] Create utility functions for validation
   - [ ] Validate bounding box coordinates
   - [ ] Validate data type values

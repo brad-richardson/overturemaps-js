@@ -87,7 +87,7 @@ for await (const feature of client.stream({
 }
 
 // Get a specific feature by GERS ID
-const feature = await client.getFeatureByGERS('08f...');
+const feature = await client.getFeatureByGERS('08f1a4a7-5a6b-4c3d-9e2f-1a2b3c4d5e6f');
 ```
 
 ### CLI Tool (Future)
