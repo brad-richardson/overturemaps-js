@@ -28,7 +28,6 @@ export type {
   MultiPolygon,
   GeometryCollection,
   GersRegistryResult,
-  ClientOptions,
 } from './types.js';
 
 export { typeThemeMap } from './types.js';

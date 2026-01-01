@@ -133,12 +133,3 @@ export interface GersRegistryResult {
   lastChanged?: string | null;
 }
 
-/**
- * Client configuration options
- */
-export interface ClientOptions {
-  /** Request timeout in milliseconds */
-  timeout?: number;
-  /** Specific release version to use (defaults to latest) */
-  release?: string;
-}

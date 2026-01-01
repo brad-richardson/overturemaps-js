@@ -6,6 +6,7 @@
  */
 
 const STAC_CATALOG_URL = 'https://stac.overturemaps.org/catalog.json';
+const FETCH_TIMEOUT_MS = 30000; // 30 second timeout
 
 export interface StacCatalog {
   type: string;
@@ -44,13 +45,32 @@ export async function getStacCatalog(forceRefresh = false): Promise<StacCatalog>
     return cachedCatalog;
   }
 
-  const response = await fetch(STAC_CATALOG_URL);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch STAC catalog: ${response.status} ${response.statusText}`);
-  }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  cachedCatalog = (await response.json()) as StacCatalog;
-  return cachedCatalog;
+  try {
+    const response = await fetch(STAC_CATALOG_URL, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch STAC catalog: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+
+    // Basic structure validation
+    if (!data || typeof data !== 'object' || !data.latest || !Array.isArray(data.links)) {
+      throw new Error('Invalid STAC catalog structure');
+    }
+
+    cachedCatalog = data as StacCatalog;
+    return cachedCatalog;
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`STAC catalog fetch timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 /**

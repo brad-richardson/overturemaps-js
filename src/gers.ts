@@ -11,6 +11,17 @@ import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types
 
 const S3_BASE_URL = 'https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com';
 
+// UUID v4 format validation regex
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Validate that a string is a valid GERS ID (UUID format).
+ * This prevents SQL injection by ensuring only valid UUIDs are used in queries.
+ */
+function isValidGersId(id: string): boolean {
+  return typeof id === 'string' && UUID_REGEX.test(id);
+}
+
 // Cached DuckDB instance
 let db: duckdb.AsyncDuckDB | null = null;
 let conn: duckdb.AsyncDuckDBConnection | null = null;
@@ -34,12 +45,14 @@ async function getDb(): Promise<duckdb.AsyncDuckDBConnection> {
 }
 
 async function doInitDuckDB(): Promise<duckdb.AsyncDuckDBConnection> {
+  let worker: Worker | null = null;
+
   try {
     // Select the best bundle for this environment
     const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
 
     // Create worker and database
-    const worker = new Worker(bundle.mainWorker!);
+    worker = new Worker(bundle.mainWorker!);
     const logger = new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING);
     db = new duckdb.AsyncDuckDB(logger, worker);
 
@@ -59,6 +72,26 @@ async function doInitDuckDB(): Promise<duckdb.AsyncDuckDBConnection> {
 
     return conn;
   } catch (error) {
+    // Clean up resources on failure
+    if (conn) {
+      try {
+        await conn.close();
+      } catch {
+        // Ignore cleanup errors
+      }
+      conn = null;
+    }
+    if (db) {
+      try {
+        await db.terminate();
+      } catch {
+        // Ignore cleanup errors
+      }
+      db = null;
+    } else if (worker) {
+      // Worker was created but db.terminate() wasn't called
+      worker.terminate();
+    }
     initPromise = null;
     throw error;
   }
@@ -110,9 +143,20 @@ function binarySearchManifest(manifest: [string, string][], gersId: string): str
  * @returns Registry result with filepath and bbox, or null if not found
  */
 export async function queryGersRegistry(gersId: string): Promise<GersRegistryResult | null> {
+  if (!isValidGersId(gersId)) {
+    throw new Error(`Invalid GERS ID format: ${gersId}. Expected UUID format.`);
+  }
+
   const gersIdLower = gersId.toLowerCase();
-  const catalog = await getStacCatalog();
-  const release = await getLatestRelease();
+
+  let catalog;
+  let release;
+  try {
+    catalog = await getStacCatalog();
+    release = await getLatestRelease();
+  } catch (error) {
+    throw new Error(`Failed to fetch STAC catalog: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   if (!catalog.registry) {
     throw new Error('Registry configuration not found in STAC catalog');
@@ -134,33 +178,38 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
   const registryUrl = `${S3_BASE_URL}/registry/${registryFile}`;
 
   // Query the registry file for this GERS ID
-  const rows = await runQuery<{
-    id: string;
-    path: string | null;
-    bbox_xmin: number | null;
-    bbox_ymin: number | null;
-    bbox_xmax: number | null;
-    bbox_ymax: number | null;
-    version: number | null;
-    first_seen: string | null;
-    last_seen: string | null;
-    last_changed: string | null;
-  }>(`
-    SELECT
-      id,
-      path,
-      bbox.xmin as bbox_xmin,
-      bbox.ymin as bbox_ymin,
-      bbox.xmax as bbox_xmax,
-      bbox.ymax as bbox_ymax,
-      version,
-      first_seen,
-      last_seen,
-      last_changed
-    FROM read_parquet('${registryUrl}')
-    WHERE id = '${gersIdLower}'
-    LIMIT 1
-  `);
+  let rows;
+  try {
+    rows = await runQuery<{
+      id: string;
+      path: string | null;
+      bbox_xmin: number | null;
+      bbox_ymin: number | null;
+      bbox_xmax: number | null;
+      bbox_ymax: number | null;
+      version: number | null;
+      first_seen: string | null;
+      last_seen: string | null;
+      last_changed: string | null;
+    }>(`
+      SELECT
+        id,
+        path,
+        bbox.xmin as bbox_xmin,
+        bbox.ymin as bbox_ymin,
+        bbox.xmax as bbox_xmax,
+        bbox.ymax as bbox_ymax,
+        version,
+        first_seen,
+        last_seen,
+        last_changed
+      FROM read_parquet('${registryUrl}')
+      WHERE id = '${gersIdLower}'
+      LIMIT 1
+    `);
+  } catch (error) {
+    throw new Error(`Failed to query GERS registry: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   if (rows.length === 0) {
     return null;
@@ -178,14 +227,19 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
   const releasePath = `overturemaps-us-west-2/release/${release}`;
   const fullPath = path.startsWith('/') ? `${releasePath}${path}` : `${releasePath}/${path}`;
 
-  // Extract bbox if available
+  // Extract bbox if all values are available
   let bbox: BoundingBox | null = null;
-  if (row.bbox_xmin !== null && row.bbox_xmin !== undefined) {
+  if (
+    row.bbox_xmin != null &&
+    row.bbox_ymin != null &&
+    row.bbox_xmax != null &&
+    row.bbox_ymax != null
+  ) {
     bbox = {
       xmin: row.bbox_xmin,
-      ymin: row.bbox_ymin!,
-      xmax: row.bbox_xmax!,
-      ymax: row.bbox_ymax!,
+      ymin: row.bbox_ymin,
+      xmax: row.bbox_xmax,
+      ymax: row.bbox_ymax,
     };
   }
 
@@ -210,6 +264,10 @@ export async function getFeatureByGersId(
   gersId: string,
   options?: { registryResult?: GersRegistryResult }
 ): Promise<Feature | null> {
+  if (!isValidGersId(gersId)) {
+    throw new Error(`Invalid GERS ID format: ${gersId}. Expected UUID format.`);
+  }
+
   const gersIdLower = gersId.toLowerCase();
 
   // Get registry result (use provided or fetch)
@@ -221,25 +279,31 @@ export async function getFeatureByGersId(
 
   const featureUrl = `${S3_BASE_URL}/${registryResult.filepath}`;
 
-  // First, get the column names (excluding geometry and bbox)
-  const schemaRows = await runQuery<{ column_name: string }>(`
-    SELECT column_name
-    FROM (DESCRIBE SELECT * FROM read_parquet('${featureUrl}') LIMIT 0)
-  `);
+  let schemaRows;
+  let rows;
+  try {
+    // First, get the column names (excluding geometry and bbox)
+    schemaRows = await runQuery<{ column_name: string }>(`
+      SELECT column_name
+      FROM (DESCRIBE SELECT * FROM read_parquet('${featureUrl}') LIMIT 0)
+    `);
 
-  const columns = schemaRows
-    .map((r) => r.column_name)
-    .filter((name) => name !== 'geometry' && name !== 'bbox');
+    const columns = schemaRows
+      .map((r) => r.column_name)
+      .filter((name) => name !== 'geometry' && name !== 'bbox');
 
-  // Query the feature file, converting geometry to GeoJSON
-  const rows = await runQuery<Record<string, unknown>>(`
-    SELECT
-      ${columns.map((c) => `"${c}"`).join(', ')},
-      ST_AsGeoJSON(ST_GeomFromWKB(geometry)) as geometry_geojson
-    FROM read_parquet('${featureUrl}')
-    WHERE id = '${gersIdLower}'
-    LIMIT 1
-  `);
+    // Query the feature file, converting geometry to GeoJSON
+    rows = await runQuery<Record<string, unknown>>(`
+      SELECT
+        ${columns.map((c) => `"${c}"`).join(', ')},
+        ST_AsGeoJSON(ST_GeomFromWKB(geometry)) as geometry_geojson
+      FROM read_parquet('${featureUrl}')
+      WHERE id = '${gersIdLower}'
+      LIMIT 1
+    `);
+  } catch (error) {
+    throw new Error(`Failed to fetch feature: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   if (rows.length === 0) {
     return null;
@@ -255,8 +319,17 @@ export async function getFeatureByGersId(
     }
   }
 
-  // Parse geometry from GeoJSON string
-  const geometry: Geometry = JSON.parse(row.geometry_geojson as string);
+  // Parse geometry from GeoJSON string with safety checks
+  if (!row.geometry_geojson || typeof row.geometry_geojson !== 'string') {
+    throw new Error('Feature has no valid geometry');
+  }
+
+  let geometry: Geometry;
+  try {
+    geometry = JSON.parse(row.geometry_geojson);
+  } catch {
+    throw new Error('Failed to parse feature geometry as GeoJSON');
+  }
 
   return {
     type: 'Feature',
@@ -276,15 +349,33 @@ export async function getFeatureByGersId(
 
 /**
  * Close the DuckDB connection and release resources.
+ * Ensures all resources are cleaned up even if some cleanup operations fail.
  */
 export async function closeDb(): Promise<void> {
+  const errors: Error[] = [];
+
   if (conn) {
-    await conn.close();
+    try {
+      await conn.close();
+    } catch (error) {
+      errors.push(error instanceof Error ? error : new Error(String(error)));
+    }
     conn = null;
   }
+
   if (db) {
-    await db.terminate();
+    try {
+      await db.terminate();
+    } catch (error) {
+      errors.push(error instanceof Error ? error : new Error(String(error)));
+    }
     db = null;
   }
+
   initPromise = null;
+
+  if (errors.length > 0) {
+    const message = errors.map((e) => e.message).join('; ');
+    throw new Error(`Failed to close database cleanly: ${message}`);
+  }
 }
