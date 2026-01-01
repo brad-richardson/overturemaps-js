@@ -1,71 +1,76 @@
 /**
  * GERS (Global Entity Reference System) lookup functionality
  *
- * Provides efficient lookup of Overture features by their GERS ID using DuckDB.
+ * Provides efficient lookup of Overture features by their GERS ID using DuckDB-WASM.
+ * Works in both browser and Node.js environments.
  */
 
-import * as duckdb from 'duckdb';
-import { getStacCatalog, getLatestRelease } from './stac';
-import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types';
+import * as duckdb from '@duckdb/duckdb-wasm';
+import { getStacCatalog, getLatestRelease } from './stac.js';
+import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types.js';
 
 const S3_BASE_URL = 'https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com';
 
 // Cached DuckDB instance
-let db: duckdb.Database | null = null;
-let conn: duckdb.Connection | null = null;
+let db: duckdb.AsyncDuckDB | null = null;
+let conn: duckdb.AsyncDuckDBConnection | null = null;
+let initPromise: Promise<duckdb.AsyncDuckDBConnection> | null = null;
 
 /**
- * Initialize DuckDB instance (cached singleton).
+ * Initialize DuckDB-WASM instance (cached singleton).
+ * Lazy loaded on first query.
  */
-async function getDb(): Promise<duckdb.Connection> {
+async function getDb(): Promise<duckdb.AsyncDuckDBConnection> {
   if (conn) {
     return conn;
   }
 
-  return new Promise((resolve, reject) => {
-    db = new duckdb.Database(':memory:', (err) => {
-      if (err) {
-        reject(err);
-        return;
-      }
+  if (initPromise) {
+    return initPromise;
+  }
 
-      conn = db!.connect();
+  initPromise = doInitDuckDB();
+  return initPromise;
+}
 
-      // Install and load spatial extension for geometry parsing
-      conn.run('INSTALL spatial; LOAD spatial;', (err) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-        // Also install httpfs for reading from HTTP URLs
-        conn!.run('INSTALL httpfs; LOAD httpfs;', (err) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-          resolve(conn!);
-        });
-      });
-    });
-  });
+async function doInitDuckDB(): Promise<duckdb.AsyncDuckDBConnection> {
+  try {
+    // Select the best bundle for this environment
+    const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+
+    // Create worker and database
+    const worker = new Worker(bundle.mainWorker!);
+    const logger = new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING);
+    db = new duckdb.AsyncDuckDB(logger, worker);
+
+    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+
+    // Create connection
+    conn = await db.connect();
+
+    // Install and load httpfs for S3 access
+    await conn.query('INSTALL httpfs;');
+    await conn.query('LOAD httpfs;');
+    await conn.query("SET s3_region = 'us-west-2';");
+
+    // Install spatial extension for ST_AsGeoJSON
+    await conn.query('INSTALL spatial;');
+    await conn.query('LOAD spatial;');
+
+    return conn;
+  } catch (error) {
+    initPromise = null;
+    throw error;
+  }
 }
 
 /**
  * Run a DuckDB query and return results as an array of objects.
  */
-function runQuery<T = Record<string, unknown>>(
-  conn: duckdb.Connection,
-  sql: string
-): Promise<T[]> {
-  return new Promise((resolve, reject) => {
-    conn.all(sql, (err, rows) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(rows as T[]);
-      }
-    });
-  });
+async function runQuery<T = Record<string, unknown>>(sql: string): Promise<T[]> {
+  const connection = await getDb();
+  const result = await connection.query(sql);
+  return result.toArray() as T[];
 }
 
 /**
@@ -126,7 +131,6 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
     return null;
   }
 
-  const conn = await getDb();
   const registryUrl = `${S3_BASE_URL}/registry/${registryFile}`;
 
   // Query the registry file for this GERS ID
@@ -141,9 +145,7 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
     first_seen: string | null;
     last_seen: string | null;
     last_changed: string | null;
-  }>(
-    conn,
-    `
+  }>(`
     SELECT
       id,
       path,
@@ -158,8 +160,7 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
     FROM read_parquet('${registryUrl}')
     WHERE id = '${gersIdLower}'
     LIMIT 1
-  `
-  );
+  `);
 
   if (rows.length === 0) {
     return null;
@@ -218,34 +219,27 @@ export async function getFeatureByGersId(
     return null;
   }
 
-  const conn = await getDb();
   const featureUrl = `${S3_BASE_URL}/${registryResult.filepath}`;
 
   // First, get the column names (excluding geometry and bbox)
-  const schemaRows = await runQuery<{ column_name: string }>(
-    conn,
-    `
+  const schemaRows = await runQuery<{ column_name: string }>(`
     SELECT column_name
     FROM (DESCRIBE SELECT * FROM read_parquet('${featureUrl}') LIMIT 0)
-  `
-  );
+  `);
 
   const columns = schemaRows
     .map((r) => r.column_name)
     .filter((name) => name !== 'geometry' && name !== 'bbox');
 
   // Query the feature file, converting geometry to GeoJSON
-  const rows = await runQuery<Record<string, unknown>>(
-    conn,
-    `
+  const rows = await runQuery<Record<string, unknown>>(`
     SELECT
       ${columns.map((c) => `"${c}"`).join(', ')},
       ST_AsGeoJSON(ST_GeomFromWKB(geometry)) as geometry_geojson
     FROM read_parquet('${featureUrl}')
     WHERE id = '${gersIdLower}'
     LIMIT 1
-  `
-  );
+  `);
 
   if (rows.length === 0) {
     return null;
@@ -284,17 +278,13 @@ export async function getFeatureByGersId(
  * Close the DuckDB connection and release resources.
  */
 export async function closeDb(): Promise<void> {
-  return new Promise((resolve) => {
-    if (conn) {
-      conn = null;
-    }
-    if (db) {
-      db.close(() => {
-        db = null;
-        resolve();
-      });
-    } else {
-      resolve();
-    }
-  });
+  if (conn) {
+    await conn.close();
+    conn = null;
+  }
+  if (db) {
+    await db.terminate();
+    db = null;
+  }
+  initPromise = null;
 }
