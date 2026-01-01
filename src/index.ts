@@ -32,6 +32,3 @@ export type {
 } from './types.js';
 
 export { typeThemeMap } from './types.js';
-
-// Package version
-export const version = '0.1.3';
