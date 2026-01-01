@@ -1,0 +1,45 @@
+{
+  "name": "@brad/overturemaps",
+  "version": "0.1.0",
+  "description": "Unofficial JavaScript/TypeScript client for Overture Maps Foundation data - inspired by overturemaps-py",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "overture",
+    "overture-maps",
+    "geospatial",
+    "maps",
+    "gis",
+    "openstreetmap",
+    "parquet",
+    "geojson"
+  ],
+  "author": "Brad Richardson",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brad-richardson/overturemaps-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/brad-richardson/overturemaps-js/issues"
+  },
+  "homepage": "https://github.com/brad-richardson/overturemaps-js#readme",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {},
+  "dependencies": {},
+  "peerDependencies": {}
+}
