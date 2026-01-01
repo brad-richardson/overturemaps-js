@@ -1,8 +1,5 @@
 /**
- * Type definitions for @brad/overturemaps
- * 
- * This file will contain all TypeScript interfaces and types
- * used throughout the library.
+ * Type definitions for @bradrichardson/overturemaps
  */
 
 /**
@@ -10,58 +7,130 @@
  */
 export interface BoundingBox {
   /** Western longitude (min longitude) */
-  west: number;
+  xmin: number;
   /** Southern latitude (min latitude) */
-  south: number;
+  ymin: number;
   /** Eastern longitude (max longitude) */
-  east: number;
+  xmax: number;
   /** Northern latitude (max latitude) */
-  north: number;
+  ymax: number;
 }
 
 /**
- * Supported Overture data types
+ * Supported Overture feature types
  */
-export type DataType = 
+export type OvertureType =
   | 'address'
-  | 'base'
+  | 'bathymetry'
   | 'building'
+  | 'building_part'
+  | 'connector'
   | 'division'
+  | 'division_area'
+  | 'division_boundary'
+  | 'infrastructure'
+  | 'land'
+  | 'land_cover'
+  | 'land_use'
   | 'place'
-  | 'transportation';
+  | 'segment'
+  | 'water';
 
 /**
- * Supported output formats
+ * Theme to type mapping (derived from type)
  */
-export type OutputFormat = 
-  | 'geojson'
-  | 'geojsonseq'
-  | 'geoparquet';
+export const typeThemeMap: Record<OvertureType, string> = {
+  address: 'addresses',
+  bathymetry: 'base',
+  building: 'buildings',
+  building_part: 'buildings',
+  connector: 'transportation',
+  division: 'divisions',
+  division_area: 'divisions',
+  division_boundary: 'divisions',
+  infrastructure: 'base',
+  land: 'base',
+  land_cover: 'base',
+  land_use: 'base',
+  place: 'places',
+  segment: 'transportation',
+  water: 'base',
+};
 
 /**
- * Options for downloading Overture data
+ * GeoJSON Feature
  */
-export interface DownloadOptions {
-  /** Type of data to download */
-  type: DataType;
-  /** Optional bounding box to filter data */
-  bbox?: BoundingBox;
-  /** Output format */
-  format: OutputFormat;
-  /** Output file path or writable stream */
-  output?: string | NodeJS.WritableStream;
+export interface Feature<G extends Geometry = Geometry, P = Record<string, unknown>> {
+  type: 'Feature';
+  id?: string | number;
+  geometry: G;
+  properties: P;
+  bbox?: [number, number, number, number];
 }
 
 /**
- * Options for streaming Overture data
+ * GeoJSON Geometry types
  */
-export interface StreamOptions {
-  /** Type of data to stream */
-  type: DataType;
-  /** Optional bounding box to filter data */
-  bbox?: BoundingBox;
-  /** Output format (defaults to geojson) */
-  format?: OutputFormat;
+export type Geometry =
+  | Point
+  | MultiPoint
+  | LineString
+  | MultiLineString
+  | Polygon
+  | MultiPolygon
+  | GeometryCollection;
+
+export interface Point {
+  type: 'Point';
+  coordinates: [number, number] | [number, number, number];
+}
+
+export interface MultiPoint {
+  type: 'MultiPoint';
+  coordinates: Array<[number, number] | [number, number, number]>;
+}
+
+export interface LineString {
+  type: 'LineString';
+  coordinates: Array<[number, number] | [number, number, number]>;
+}
+
+export interface MultiLineString {
+  type: 'MultiLineString';
+  coordinates: Array<Array<[number, number] | [number, number, number]>>;
+}
+
+export interface Polygon {
+  type: 'Polygon';
+  coordinates: Array<Array<[number, number] | [number, number, number]>>;
+}
+
+export interface MultiPolygon {
+  type: 'MultiPolygon';
+  coordinates: Array<Array<Array<[number, number] | [number, number, number]>>>;
+}
+
+export interface GeometryCollection {
+  type: 'GeometryCollection';
+  geometries: Geometry[];
+}
+
+/**
+ * GERS registry entry result
+ */
+export interface GersRegistryResult {
+  /** S3 path to the feature's parquet file */
+  filepath: string;
+  /** Bounding box of the feature */
+  bbox: BoundingBox | null;
+  /** GERS version */
+  version?: number;
+  /** First release this feature appeared */
+  firstSeen?: string;
+  /** Last release this feature appeared */
+  lastSeen?: string;
+  /** Last release this feature was modified */
+  lastChanged?: string | null;
 }
 
 /**
@@ -70,33 +139,6 @@ export interface StreamOptions {
 export interface ClientOptions {
   /** Request timeout in milliseconds */
   timeout?: number;
-  /** Connection timeout in milliseconds */
-  connectionTimeout?: number;
-  /** Skip STAC catalog and use S3 directly */
-  skipCatalog?: boolean;
+  /** Specific release version to use (defaults to latest) */
+  release?: string;
 }
-
-/**
- * GeoJSON Feature (simplified)
- * Full GeoJSON spec: https://tools.ietf.org/html/rfc7946
- */
-export interface Feature {
-  type: 'Feature';
-  geometry: Geometry;
-  properties: Record<string, any>;
-  id?: string | number;
-}
-
-/**
- * GeoJSON Geometry (simplified)
- */
-export interface Geometry {
-  type: string;
-  coordinates: any;
-}
-
-// TODO: Add more detailed type definitions as implementation progresses
-// - STAC catalog types
-// - Error types
-// - Event types for progress tracking
-// - Additional GeoJSON types
