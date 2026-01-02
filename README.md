@@ -13,7 +13,7 @@ npm install @bradrichardson/overturemaps
 ## Features
 
 - **STAC Integration**: Dynamically discover available releases (no hardcoded versions)
-- **GERS Lookup**: Fetch features by Global Entity Reference System ID using DuckDB
+- **GERS Lookup**: Fetch features by Global Entity Reference System ID using hyparquet
 - **TypeScript First**: Full type definitions and excellent IDE support
 
 ## Usage
