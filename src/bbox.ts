@@ -9,6 +9,7 @@
 
 import { tableFromIPC } from 'apache-arrow';
 import type { Table as ArrowTable, StructRowProxy } from 'apache-arrow';
+import wkx from 'wkx';
 import { getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, Geometry, OvertureType } from './types.js';
 
@@ -188,8 +189,6 @@ export async function getFilesFromStac(
  */
 function wkbToGeoJSON(wkbBytes: Uint8Array): Geometry | null {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const wkx = require('wkx') as { Geometry: { parse(buffer: Buffer): { toGeoJSON(): object } } };
     const buffer = Buffer.from(wkbBytes);
     const geometry = wkx.Geometry.parse(buffer);
     return geometry.toGeoJSON() as Geometry;

@@ -7,6 +7,7 @@
 
 import { tableFromIPC } from 'apache-arrow';
 import type { Table as ArrowTable } from 'apache-arrow';
+import wkx from 'wkx';
 import { getStacCatalog, getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types.js';
 
@@ -191,8 +192,6 @@ async function queryFeatureById(
  */
 function wkbToGeoJSON(wkbBytes: Uint8Array): Geometry | null {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const wkx = require('wkx') as { Geometry: { parse(buffer: Buffer): { toGeoJSON(): object } } };
     const buffer = Buffer.from(wkbBytes);
     const geometry = wkx.Geometry.parse(buffer);
     return geometry.toGeoJSON() as Geometry;
