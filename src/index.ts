@@ -14,6 +14,10 @@ export type { StacCatalog, StacLink, StacRegistry } from './stac.js';
 // GERS lookup functions
 export { queryGersRegistry, getFeatureByGersId, closeDb } from './gers.js';
 
+// Bounding box query functions
+export { readByBbox, readByBboxAll, getFilesFromStac } from './bbox.js';
+export type { ReadByBboxOptions } from './bbox.js';
+
 // Type definitions
 export type {
   BoundingBox,
