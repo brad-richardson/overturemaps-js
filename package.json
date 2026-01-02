@@ -1,6 +1,6 @@
 {
   "name": "@bradrichardson/overturemaps",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Unofficial JavaScript/TypeScript client for Overture Maps Foundation data - inspired by overturemaps-py",
   "type": "module",
   "main": "dist/index.js",
