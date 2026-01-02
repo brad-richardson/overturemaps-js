@@ -49,6 +49,33 @@ function getCollectionsParquetUrl(release: string): string {
 }
 
 /**
+ * Create an AsyncBuffer from a pre-fetched ArrayBuffer.
+ * Used for files that need to be fully downloaded (e.g., from servers
+ * that don't properly support HTTP range requests).
+ */
+function asyncBufferFromArrayBuffer(buffer: ArrayBuffer): AsyncBuffer {
+  return {
+    byteLength: buffer.byteLength,
+    slice(start: number, end?: number): Promise<ArrayBuffer> {
+      return Promise.resolve(buffer.slice(start, end));
+    },
+  };
+}
+
+/**
+ * Fetch entire file and create an AsyncBuffer.
+ * Used for STAC collections.parquet which may not support range requests properly.
+ */
+async function fetchFullFile(url: string): Promise<AsyncBuffer> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
+  }
+  const buffer = await response.arrayBuffer();
+  return asyncBufferFromArrayBuffer(buffer);
+}
+
+/**
  * Create a cached AsyncBuffer for a URL.
  * Uses HTTP range requests and caches fetched byte ranges.
  */
@@ -87,7 +114,9 @@ export async function getFilesFromStac(
   let metadata: FileMetaData;
 
   try {
-    file = await getCachedFile(collectionsUrl);
+    // Use full file fetch for STAC collections.parquet as the server may not
+    // properly support HTTP range requests
+    file = await fetchFullFile(collectionsUrl);
     metadata = await parquetMetadataAsync(file);
   } catch (error) {
     throw new Error(
