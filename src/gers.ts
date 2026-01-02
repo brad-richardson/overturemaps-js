@@ -1,22 +1,19 @@
 /**
  * GERS (Global Entity Reference System) lookup functionality
  *
- * Provides efficient lookup of Overture features by their GERS ID using hyparquet.
+ * Provides efficient lookup of Overture features by their GERS ID.
+ * Prefers DuckDB-WASM for predicate pushdown when available, falls back to parquet-wasm.
  * Works in both browser and Node.js environments.
  */
 
-import {
-  asyncBufferFromUrl,
-  cachedAsyncBuffer,
-  parquetMetadataAsync,
-  parquetSchema,
-  parquetQuery,
-} from 'hyparquet';
-import type { AsyncBuffer, FileMetaData } from 'hyparquet';
+import { tableFromIPC } from 'apache-arrow';
+import type { Table as ArrowTable } from 'apache-arrow';
+import { S3_BASE_URL } from './constants.js';
+import { isDuckDBAvailable, queryParquetById } from './duckdb.js';
+import { getParquetWasm, readParquetFromUrl } from './parquet.js';
 import { getStacCatalog, getLatestRelease } from './stac.js';
-import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types.js';
-
-const S3_BASE_URL = 'https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com';
+import type { BoundingBox, Feature, GersRegistryResult } from './types.js';
+import { wkbToGeoJSON } from './wkb.js';
 
 // UUID v4 format validation regex
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -60,32 +57,96 @@ function binarySearchManifest(manifest: [string, string][], gersId: string): str
 }
 
 /**
- * Create a cached AsyncBuffer for a URL.
- * Uses HTTP range requests and caches fetched byte ranges.
+ * Query the registry file for a specific GERS ID using DuckDB (predicate pushdown).
  */
-async function getCachedFile(url: string): Promise<AsyncBuffer> {
-  const file = await asyncBufferFromUrl({ url });
-  return cachedAsyncBuffer(file);
+async function queryRegistryByIdDuckDB(
+  registryUrl: string,
+  gersId: string
+): Promise<Record<string, unknown> | null> {
+  return queryParquetById(registryUrl, gersId, 'id');
 }
 
 /**
- * Query a Parquet file by ID, returning the first matching row.
- * Reuses the provided file buffer and metadata to avoid duplicate fetches.
+ * Query the registry file for a specific GERS ID using parquet-wasm (fallback).
+ * Returns the first matching row.
  */
-async function queryParquetById<T extends Record<string, unknown>>(
-  file: AsyncBuffer,
-  metadata: FileMetaData,
-  id: string,
-  columns?: string[]
-): Promise<T | null> {
-  const rows = (await parquetQuery({
-    file,
-    metadata,
-    columns,
-    filter: { id: { $eq: id } },
-  })) as T[];
+async function queryRegistryByIdParquet(
+  registryUrl: string,
+  gersId: string
+): Promise<Record<string, unknown> | null> {
+  const rows = await readParquetFromUrl(registryUrl, {
+    columns: ['id', 'path', 'bbox', 'version', 'first_seen', 'last_seen', 'last_changed'],
+  });
 
-  return rows.length > 0 ? rows[0] : null;
+  // Find the row with matching ID
+  for (const row of rows) {
+    if ((row.id as string)?.toLowerCase() === gersId) {
+      return row;
+    }
+  }
+  return null;
+}
+
+/**
+ * Query the feature file for a specific GERS ID using DuckDB (predicate pushdown).
+ */
+async function queryFeatureByIdDuckDB(
+  featureUrl: string,
+  gersId: string
+): Promise<Record<string, unknown> | null> {
+  return queryParquetById(featureUrl, gersId, 'id');
+}
+
+/**
+ * Query the feature file for a specific GERS ID using parquet-wasm streaming (fallback).
+ * Uses HTTP range requests for efficient access to remote files.
+ */
+async function queryFeatureByIdParquet(
+  featureUrl: string,
+  gersId: string
+): Promise<Record<string, unknown> | null> {
+  const parquetWasm = await getParquetWasm();
+
+  // Use ParquetFile for streaming from URL with HTTP range requests
+  const parquetFile = await parquetWasm.ParquetFile.fromUrl(featureUrl);
+
+  try {
+    // Stream with limit=1 since we only expect one match
+    const stream = await parquetFile.stream({
+      batchSize: 1024,
+      concurrency: 4,
+    });
+
+    // Process batches looking for our ID using reader pattern
+    // (ReadableStream doesn't have async iterator in all environments)
+    const reader = stream.getReader();
+    try {
+      while (true) {
+        const { done, value: wasmRecordBatch } = await reader.read();
+        if (done) break;
+
+        const ipcStream = wasmRecordBatch.intoIPCStream();
+        const arrowTable: ArrowTable = tableFromIPC(ipcStream);
+
+        for (const row of arrowTable) {
+          const rowObj = row.toJSON() as Record<string, unknown>;
+          if ((rowObj.id as string)?.toLowerCase() === gersId) {
+            // Found it! Include raw geometry bytes for conversion
+            return {
+              ...rowObj,
+              geometry: row.geometry, // Keep as raw Arrow value
+            };
+          }
+        }
+      }
+
+      return null;
+    } finally {
+      reader.releaseLock();
+    }
+  } finally {
+    parquetFile.free();
+  }
 }
 
 /**
@@ -131,34 +192,15 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
 
   const registryUrl = `${S3_BASE_URL}/registry/${registryFile}`;
 
-  // Query the registry file for this GERS ID
-  let row;
-  try {
-    const file = await getCachedFile(registryUrl);
-    const metadata = await parquetMetadataAsync(file);
+  // Check if DuckDB is available for faster predicate pushdown queries
+  const useDuckDB = await isDuckDBAvailable();
 
-    row = await queryParquetById<{
-      id: string;
-      path: string | null;
-      bbox: {
-        xmin: number | null;
-        ymin: number | null;
-        xmax: number | null;
-        ymax: number | null;
-      } | null;
-      version: number | null;
-      first_seen: string | null;
-      last_seen: string | null;
-      last_changed: string | null;
-    }>(file, metadata, gersIdLower, [
-      'id',
-      'path',
-      'bbox',
-      'version',
-      'first_seen',
-      'last_seen',
-      'last_changed',
-    ]);
+  // Query the registry file for this GERS ID
+  let row: Record<string, unknown> | null;
+  try {
+    row = useDuckDB
+      ? await queryRegistryByIdDuckDB(registryUrl, gersIdLower)
+      : await queryRegistryByIdParquet(registryUrl, gersIdLower);
   } catch (error) {
     throw new Error(
       `Failed to query GERS registry: ${error instanceof Error ? error.message : String(error)}`
@@ -169,7 +211,7 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
     return null;
   }
 
-  const path = row.path;
+  const path = row.path as string | null;
 
   // If path is null, feature is not in current release
   if (path === null || path === undefined) {
@@ -182,28 +224,29 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
 
   // Extract bbox if all values are available
   let bbox: BoundingBox | null = null;
+  const rowBbox = row.bbox as { xmin?: number; ymin?: number; xmax?: number; ymax?: number } | null;
   if (
-    row.bbox &&
-    row.bbox.xmin != null &&
-    row.bbox.ymin != null &&
-    row.bbox.xmax != null &&
-    row.bbox.ymax != null
+    rowBbox &&
+    rowBbox.xmin != null &&
+    rowBbox.ymin != null &&
+    rowBbox.xmax != null &&
+    rowBbox.ymax != null
   ) {
     bbox = {
-      xmin: row.bbox.xmin,
-      ymin: row.bbox.ymin,
-      xmax: row.bbox.xmax,
-      ymax: row.bbox.ymax,
+      xmin: rowBbox.xmin,
+      ymin: rowBbox.ymin,
+      xmax: rowBbox.xmax,
+      ymax: rowBbox.ymax,
     };
   }
 
   return {
     filepath: fullPath,
     bbox,
-    version: row.version ?? undefined,
-    firstSeen: row.first_seen ?? undefined,
-    lastSeen: row.last_seen ?? undefined,
-    lastChanged: row.last_changed ?? undefined,
+    version: (row.version as number) ?? undefined,
+    firstSeen: (row.first_seen as string) ?? undefined,
+    lastSeen: (row.last_seen as string) ?? undefined,
+    lastChanged: (row.last_changed as string) ?? undefined,
   };
 }
 
@@ -233,24 +276,14 @@ export async function getFeatureByGersId(
 
   const featureUrl = `${S3_BASE_URL}/${registryResult.filepath}`;
 
+  // Check if DuckDB is available for faster predicate pushdown queries
+  const useDuckDB = await isDuckDBAvailable();
+
   let row: Record<string, unknown> | null;
   try {
-    // Create a cached file buffer - reused for metadata and query
-    const file = await getCachedFile(featureUrl);
-    const metadata = await parquetMetadataAsync(file);
-
-    // Get column names from schema (excluding bbox since we get it from registry)
-    const schema = parquetSchema(metadata);
-    const columns = schema.children.map((child) => child.element.name);
-    const columnsToRead = columns.filter((name) => name !== 'bbox');
-
-    // Query the feature file using the same cached file and metadata
-    row = await queryParquetById<Record<string, unknown>>(
-      file,
-      metadata,
-      gersIdLower,
-      columnsToRead
-    );
+    row = useDuckDB
+      ? await queryFeatureByIdDuckDB(featureUrl, gersIdLower)
+      : await queryFeatureByIdParquet(featureUrl, gersIdLower);
   } catch (error) {
     throw new Error(
       `Failed to fetch feature: ${error instanceof Error ? error.message : String(error)}`
@@ -269,10 +302,15 @@ export async function getFeatureByGersId(
     }
   }
 
-  // Get geometry (hyparquet automatically converts WKB to GeoJSON for GeoParquet files)
-  const geometry = row.geometry as Geometry | undefined;
-  if (!geometry) {
+  // Get geometry (WKB bytes from Arrow)
+  const geometryBytes = row.geometry as Uint8Array | undefined;
+  if (!geometryBytes) {
     throw new Error('Feature has no valid geometry');
+  }
+
+  const geometry = wkbToGeoJSON(geometryBytes);
+  if (!geometry) {
+    throw new Error('Failed to parse geometry');
   }
 
   return {
@@ -292,10 +330,14 @@ export async function getFeatureByGersId(
 }
 
 /**
- * Close resources (no-op for hyparquet, kept for API compatibility).
- * @deprecated This function is no longer needed with hyparquet.
+ * Close resources. Closes DuckDB connection if one was created.
  */
 export async function closeDb(): Promise<void> {
-  // No persistent connection to close with hyparquet
-  // Kept for backwards API compatibility
+  // Import dynamically to avoid issues if duckdb is not installed
+  try {
+    const { closeDuckDB } = await import('./duckdb.js');
+    await closeDuckDB();
+  } catch {
+    // DuckDB not available or not initialized, nothing to close
+  }
 }
