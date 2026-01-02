@@ -35,11 +35,11 @@ interface StacCollectionItem {
 
 /**
  * Options for readByBbox
+ *
+ * Currently no options are available; this interface is reserved for future use.
  */
-export interface ReadByBboxOptions {
-  /** Use STAC index to filter files by bbox (recommended for large datasets) */
-  useStacIndex?: boolean;
-}
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export interface ReadByBboxOptions {}
 
 /**
  * Get the collections.parquet URL for a release
@@ -67,12 +67,13 @@ function bboxIntersects(a: BoundingBox, b: BoundingBox): boolean {
 /**
  * Get files from STAC that intersect with the given bounding box.
  *
- * Reads the collections.parquet file to find data files whose spatial extent
- * overlaps with the provided bounding box.
+ * This is an advanced/low-level function that queries the STAC collections.parquet
+ * index to find data files whose spatial extent overlaps with the provided bounding box.
+ * Most users should use {@link readByBbox} or {@link readByBboxAll} instead.
  *
  * @param overtureType - The Overture feature type
  * @param bbox - Bounding box to filter by
- * @param release - Release version
+ * @param release - Release version string (e.g., "2024-12-18.0")
  * @returns List of S3 file paths that intersect with the bbox
  */
 export async function getFilesFromStac(
@@ -176,12 +177,23 @@ async function readFeaturesFromFile(
     } | null;
 
     // Apply bbox filter if provided
-    if (bbox && rowBbox) {
+    if (bbox) {
+      // Skip features with incomplete bbox data
+      if (
+        !rowBbox ||
+        rowBbox.xmin == null ||
+        rowBbox.ymin == null ||
+        rowBbox.xmax == null ||
+        rowBbox.ymax == null
+      ) {
+        continue;
+      }
+
       const featureBbox: BoundingBox = {
-        xmin: rowBbox.xmin ?? -180,
-        ymin: rowBbox.ymin ?? -90,
-        xmax: rowBbox.xmax ?? 180,
-        ymax: rowBbox.ymax ?? 90,
+        xmin: rowBbox.xmin,
+        ymin: rowBbox.ymin,
+        xmax: rowBbox.xmax,
+        ymax: rowBbox.ymax,
       };
 
       if (!bboxIntersects(bbox, featureBbox)) {
@@ -234,10 +246,14 @@ async function readFeaturesFromFile(
  * This function discovers relevant parquet files using the STAC index,
  * then reads and filters features that intersect with the given bounding box.
  *
+ * Note: This function uses fail-fast error handling. If reading any file fails,
+ * the entire operation stops and throws an error. Partial results are not returned.
+ *
  * @param overtureType - The Overture feature type to query
  * @param bbox - Geographic bounding box to filter by
- * @param options - Optional configuration
+ * @param _options - Reserved for future use
  * @returns Async generator yielding features within the bounding box
+ * @throws Error if the release cannot be fetched, STAC index fails, or any file read fails
  *
  * @example
  * ```typescript
@@ -254,10 +270,8 @@ async function readFeaturesFromFile(
 export async function* readByBbox(
   overtureType: OvertureType,
   bbox: BoundingBox,
-  options: ReadByBboxOptions = {}
+  _options: ReadByBboxOptions = {}
 ): AsyncGenerator<Feature, void, unknown> {
-  const { useStacIndex = true } = options;
-
   // Validate bbox
   if (bbox.xmin >= bbox.xmax || bbox.ymin >= bbox.ymax) {
     throw new Error(
@@ -275,24 +289,14 @@ export async function* readByBbox(
     );
   }
 
-  let filePaths: string[];
+  // Use STAC index to find files that intersect with bbox
+  const filePaths = await getFilesFromStac(overtureType, bbox, release);
 
-  if (useStacIndex) {
-    // Use STAC index to find files that intersect with bbox
-    filePaths = await getFilesFromStac(overtureType, bbox, release);
-
-    if (filePaths.length === 0) {
-      return; // No intersecting files found
-    }
-  } else {
-    // Without STAC index, we would need to list all files in the dataset
-    // This is not recommended for large datasets
-    throw new Error(
-      'Non-STAC index reading is not currently supported. Use useStacIndex: true'
-    );
+  if (filePaths.length === 0) {
+    return; // No intersecting files found
   }
 
-  // Read features from each file
+  // Read features from each file (fail-fast: stops on first error)
   for (const filePath of filePaths) {
     const features = await readFeaturesFromFile(filePath, bbox);
     for (const feature of features) {
@@ -307,10 +311,14 @@ export async function* readByBbox(
  * This is a convenience function that collects all features from the
  * async generator into an array.
  *
+ * Note: This function uses fail-fast error handling. If reading any file fails,
+ * the entire operation stops and throws an error. Partial results are not returned.
+ *
  * @param overtureType - The Overture feature type to query
  * @param bbox - Geographic bounding box to filter by
- * @param options - Optional configuration
+ * @param _options - Reserved for future use
  * @returns Promise resolving to array of features within the bounding box
+ * @throws Error if the release cannot be fetched, STAC index fails, or any file read fails
  *
  * @example
  * ```typescript
@@ -322,10 +330,10 @@ export async function* readByBbox(
 export async function readByBboxAll(
   overtureType: OvertureType,
   bbox: BoundingBox,
-  options: ReadByBboxOptions = {}
+  _options: ReadByBboxOptions = {}
 ): Promise<Feature[]> {
   const features: Feature[] = [];
-  for await (const feature of readByBbox(overtureType, bbox, options)) {
+  for await (const feature of readByBbox(overtureType, bbox)) {
     features.push(feature);
   }
   return features;

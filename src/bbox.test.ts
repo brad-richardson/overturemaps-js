@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getFilesFromStac, readByBbox, readByBboxAll } from './bbox';
 import { clearCache, getLatestRelease } from './stac';
-import type { BoundingBox, OvertureType } from './types';
+import type { BoundingBox } from './types';
 
 describe('Bounding Box Queries', () => {
   beforeEach(() => {
