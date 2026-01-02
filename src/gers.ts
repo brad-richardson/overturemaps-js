@@ -7,7 +7,7 @@
 
 import { tableFromIPC } from 'apache-arrow';
 import type { Table as ArrowTable } from 'apache-arrow';
-import * as parquetWasm from 'parquet-wasm';
+import * as parquetWasm from 'parquet-wasm/esm';
 import wkx from 'wkx';
 import { getStacCatalog, getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types.js';
