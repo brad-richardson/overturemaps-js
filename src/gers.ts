@@ -1,11 +1,18 @@
 /**
  * GERS (Global Entity Reference System) lookup functionality
  *
- * Provides efficient lookup of Overture features by their GERS ID using DuckDB-WASM.
+ * Provides efficient lookup of Overture features by their GERS ID using hyparquet.
  * Works in both browser and Node.js environments.
  */
 
-import * as duckdb from '@duckdb/duckdb-wasm';
+import {
+  asyncBufferFromUrl,
+  cachedAsyncBuffer,
+  parquetMetadataAsync,
+  parquetSchema,
+  parquetQuery,
+} from 'hyparquet';
+import type { AsyncBuffer, FileMetaData } from 'hyparquet';
 import { getStacCatalog, getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types.js';
 
@@ -16,94 +23,10 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 
 /**
  * Validate that a string is a valid GERS ID (UUID format).
- * This prevents SQL injection by ensuring only valid UUIDs are used in queries.
+ * This prevents injection by ensuring only valid UUIDs are used in queries.
  */
 function isValidGersId(id: string): boolean {
   return typeof id === 'string' && UUID_REGEX.test(id);
-}
-
-// Cached DuckDB instance
-let db: duckdb.AsyncDuckDB | null = null;
-let conn: duckdb.AsyncDuckDBConnection | null = null;
-let initPromise: Promise<duckdb.AsyncDuckDBConnection> | null = null;
-
-/**
- * Initialize DuckDB-WASM instance (cached singleton).
- * Lazy loaded on first query.
- */
-async function getDb(): Promise<duckdb.AsyncDuckDBConnection> {
-  if (conn) {
-    return conn;
-  }
-
-  if (initPromise) {
-    return initPromise;
-  }
-
-  initPromise = doInitDuckDB();
-  return initPromise;
-}
-
-async function doInitDuckDB(): Promise<duckdb.AsyncDuckDBConnection> {
-  let worker: Worker | null = null;
-
-  try {
-    // Select the best bundle for this environment
-    const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
-
-    // Create worker and database
-    worker = new Worker(bundle.mainWorker!);
-    const logger = new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING);
-    db = new duckdb.AsyncDuckDB(logger, worker);
-
-    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
-
-    // Create connection
-    conn = await db.connect();
-
-    // Install and load httpfs for S3 access
-    await conn.query('INSTALL httpfs;');
-    await conn.query('LOAD httpfs;');
-    await conn.query("SET s3_region = 'us-west-2';");
-
-    // Install spatial extension for ST_AsGeoJSON
-    await conn.query('INSTALL spatial;');
-    await conn.query('LOAD spatial;');
-
-    return conn;
-  } catch (error) {
-    // Clean up resources on failure
-    if (conn) {
-      try {
-        await conn.close();
-      } catch {
-        // Ignore cleanup errors
-      }
-      conn = null;
-    }
-    if (db) {
-      try {
-        await db.terminate();
-      } catch {
-        // Ignore cleanup errors
-      }
-      db = null;
-    } else if (worker) {
-      // Worker was created but db.terminate() wasn't called
-      worker.terminate();
-    }
-    initPromise = null;
-    throw error;
-  }
-}
-
-/**
- * Run a DuckDB query and return results as an array of objects.
- */
-async function runQuery<T = Record<string, unknown>>(sql: string): Promise<T[]> {
-  const connection = await getDb();
-  const result = await connection.query(sql);
-  return result.toArray() as T[];
 }
 
 /**
@@ -137,6 +60,35 @@ function binarySearchManifest(manifest: [string, string][], gersId: string): str
 }
 
 /**
+ * Create a cached AsyncBuffer for a URL.
+ * Uses HTTP range requests and caches fetched byte ranges.
+ */
+async function getCachedFile(url: string): Promise<AsyncBuffer> {
+  const file = await asyncBufferFromUrl({ url });
+  return cachedAsyncBuffer(file);
+}
+
+/**
+ * Query a Parquet file by ID, returning the first matching row.
+ * Reuses the provided file buffer and metadata to avoid duplicate fetches.
+ */
+async function queryParquetById<T extends Record<string, unknown>>(
+  file: AsyncBuffer,
+  metadata: FileMetaData,
+  id: string,
+  columns?: string[]
+): Promise<T | null> {
+  const rows = (await parquetQuery({
+    file,
+    metadata,
+    columns,
+    filter: { id: { $eq: id } },
+  })) as T[];
+
+  return rows.length > 0 ? rows[0] : null;
+}
+
+/**
  * Query the GERS registry to get metadata for a given GERS ID.
  *
  * @param gersId - The GERS ID to look up (UUID format)
@@ -155,7 +107,9 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
     catalog = await getStacCatalog();
     release = await getLatestRelease();
   } catch (error) {
-    throw new Error(`Failed to fetch STAC catalog: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Failed to fetch STAC catalog: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 
   if (!catalog.registry) {
@@ -178,44 +132,43 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
   const registryUrl = `${S3_BASE_URL}/registry/${registryFile}`;
 
   // Query the registry file for this GERS ID
-  let rows;
+  let row;
   try {
-    rows = await runQuery<{
+    const file = await getCachedFile(registryUrl);
+    const metadata = await parquetMetadataAsync(file);
+
+    row = await queryParquetById<{
       id: string;
       path: string | null;
-      bbox_xmin: number | null;
-      bbox_ymin: number | null;
-      bbox_xmax: number | null;
-      bbox_ymax: number | null;
+      bbox: {
+        xmin: number | null;
+        ymin: number | null;
+        xmax: number | null;
+        ymax: number | null;
+      } | null;
       version: number | null;
       first_seen: string | null;
       last_seen: string | null;
       last_changed: string | null;
-    }>(`
-      SELECT
-        id,
-        path,
-        bbox.xmin as bbox_xmin,
-        bbox.ymin as bbox_ymin,
-        bbox.xmax as bbox_xmax,
-        bbox.ymax as bbox_ymax,
-        version,
-        first_seen,
-        last_seen,
-        last_changed
-      FROM read_parquet('${registryUrl}')
-      WHERE id = '${gersIdLower}'
-      LIMIT 1
-    `);
+    }>(file, metadata, gersIdLower, [
+      'id',
+      'path',
+      'bbox',
+      'version',
+      'first_seen',
+      'last_seen',
+      'last_changed',
+    ]);
   } catch (error) {
-    throw new Error(`Failed to query GERS registry: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Failed to query GERS registry: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 
-  if (rows.length === 0) {
+  if (!row) {
     return null;
   }
 
-  const row = rows[0];
   const path = row.path;
 
   // If path is null, feature is not in current release
@@ -230,16 +183,17 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
   // Extract bbox if all values are available
   let bbox: BoundingBox | null = null;
   if (
-    row.bbox_xmin != null &&
-    row.bbox_ymin != null &&
-    row.bbox_xmax != null &&
-    row.bbox_ymax != null
+    row.bbox &&
+    row.bbox.xmin != null &&
+    row.bbox.ymin != null &&
+    row.bbox.xmax != null &&
+    row.bbox.ymax != null
   ) {
     bbox = {
-      xmin: row.bbox_xmin,
-      ymin: row.bbox_ymin,
-      xmax: row.bbox_xmax,
-      ymax: row.bbox_ymax,
+      xmin: row.bbox.xmin,
+      ymin: row.bbox.ymin,
+      xmax: row.bbox.xmax,
+      ymax: row.bbox.ymax,
     };
   }
 
@@ -279,56 +233,46 @@ export async function getFeatureByGersId(
 
   const featureUrl = `${S3_BASE_URL}/${registryResult.filepath}`;
 
-  let schemaRows;
-  let rows;
+  let row: Record<string, unknown> | null;
   try {
-    // First, get the column names (excluding geometry and bbox)
-    schemaRows = await runQuery<{ column_name: string }>(`
-      SELECT column_name
-      FROM (DESCRIBE SELECT * FROM read_parquet('${featureUrl}') LIMIT 0)
-    `);
+    // Create a cached file buffer - reused for metadata and query
+    const file = await getCachedFile(featureUrl);
+    const metadata = await parquetMetadataAsync(file);
 
-    const columns = schemaRows
-      .map((r) => r.column_name)
-      .filter((name) => name !== 'geometry' && name !== 'bbox');
+    // Get column names from schema (excluding bbox since we get it from registry)
+    const schema = parquetSchema(metadata);
+    const columns = schema.children.map((child) => child.element.name);
+    const columnsToRead = columns.filter((name) => name !== 'bbox');
 
-    // Query the feature file, converting geometry to GeoJSON
-    rows = await runQuery<Record<string, unknown>>(`
-      SELECT
-        ${columns.map((c) => `"${c}"`).join(', ')},
-        ST_AsGeoJSON(ST_GeomFromWKB(geometry)) as geometry_geojson
-      FROM read_parquet('${featureUrl}')
-      WHERE id = '${gersIdLower}'
-      LIMIT 1
-    `);
+    // Query the feature file using the same cached file and metadata
+    row = await queryParquetById<Record<string, unknown>>(
+      file,
+      metadata,
+      gersIdLower,
+      columnsToRead
+    );
   } catch (error) {
-    throw new Error(`Failed to fetch feature: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Failed to fetch feature: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 
-  if (rows.length === 0) {
+  if (!row) {
     return null;
   }
 
-  const row = rows[0];
-
-  // Build properties from all columns except geometry_geojson
+  // Build properties from all columns except geometry
   const properties: Record<string, unknown> = {};
   for (const key of Object.keys(row)) {
-    if (key !== 'geometry_geojson') {
+    if (key !== 'geometry') {
       properties[key] = row[key];
     }
   }
 
-  // Parse geometry from GeoJSON string with safety checks
-  if (!row.geometry_geojson || typeof row.geometry_geojson !== 'string') {
+  // Get geometry (hyparquet automatically converts WKB to GeoJSON for GeoParquet files)
+  const geometry = row.geometry as Geometry | undefined;
+  if (!geometry) {
     throw new Error('Feature has no valid geometry');
-  }
-
-  let geometry: Geometry;
-  try {
-    geometry = JSON.parse(row.geometry_geojson);
-  } catch {
-    throw new Error('Failed to parse feature geometry as GeoJSON');
   }
 
   return {
@@ -348,34 +292,10 @@ export async function getFeatureByGersId(
 }
 
 /**
- * Close the DuckDB connection and release resources.
- * Ensures all resources are cleaned up even if some cleanup operations fail.
+ * Close resources (no-op for hyparquet, kept for API compatibility).
+ * @deprecated This function is no longer needed with hyparquet.
  */
 export async function closeDb(): Promise<void> {
-  const errors: Error[] = [];
-
-  if (conn) {
-    try {
-      await conn.close();
-    } catch (error) {
-      errors.push(error instanceof Error ? error : new Error(String(error)));
-    }
-    conn = null;
-  }
-
-  if (db) {
-    try {
-      await db.terminate();
-    } catch (error) {
-      errors.push(error instanceof Error ? error : new Error(String(error)));
-    }
-    db = null;
-  }
-
-  initPromise = null;
-
-  if (errors.length > 0) {
-    const message = errors.map((e) => e.message).join('; ');
-    throw new Error(`Failed to close database cleanly: ${message}`);
-  }
+  // No persistent connection to close with hyparquet
+  // Kept for backwards API compatibility
 }

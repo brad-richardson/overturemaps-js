@@ -1,6 +1,6 @@
 {
   "name": "@bradrichardson/overturemaps",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Unofficial JavaScript/TypeScript client for Overture Maps Foundation data - inspired by overturemaps-py",
   "type": "module",
   "main": "dist/index.js",
@@ -27,9 +27,9 @@
     "gis",
     "openstreetmap",
     "parquet",
+    "geoparquet",
     "geojson",
-    "gers",
-    "duckdb"
+    "gers"
   ],
   "author": "Brad Richardson",
   "license": "MIT",
@@ -42,7 +42,7 @@
   },
   "homepage": "https://github.com/brad-richardson/overturemaps-js#readme",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=18.0.0"
   },
   "files": [
     "dist",
@@ -53,7 +53,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@duckdb/duckdb-wasm": "^1.29.0"
+    "hyparquet": "^1.23.3"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
