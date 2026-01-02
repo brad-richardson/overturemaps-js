@@ -7,6 +7,7 @@
 
 import { tableFromIPC } from 'apache-arrow';
 import type { Table as ArrowTable } from 'apache-arrow';
+import * as parquetWasm from 'parquet-wasm';
 import wkx from 'wkx';
 import { getStacCatalog, getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types.js';
@@ -17,32 +18,22 @@ const S3_BASE_URL = 'https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com';
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Type for the parquet-wasm module (lazy loaded)
+ * Track WASM initialization state
  */
-type ParquetWasmModule = typeof import('parquet-wasm');
-
-/**
- * Lazy-loaded parquet-wasm module
- */
-let parquetWasmModule: ParquetWasmModule | null = null;
 let wasmInitialized = false;
 
 /**
- * Lazy load and initialize parquet-wasm
+ * Initialize parquet-wasm if needed (for browser environments)
  */
-async function getParquetWasm(): Promise<ParquetWasmModule> {
-  if (!parquetWasmModule) {
-    // Dynamic import for lazy loading - uses node export automatically in Node.js
-    parquetWasmModule = await import('parquet-wasm');
-  }
-
+async function ensureWasmInitialized(): Promise<void> {
   if (!wasmInitialized) {
-    // Initialize WASM - the default export is the init function
-    await parquetWasmModule.default();
+    // In browser environments, we need to call the default init function
+    // In Node.js with the node export, this is already initialized
+    if (typeof parquetWasm.default === 'function') {
+      await parquetWasm.default();
+    }
     wasmInitialized = true;
   }
-
-  return parquetWasmModule;
 }
 
 /**
@@ -90,7 +81,7 @@ async function readParquetFromUrl(
   url: string,
   options?: { columns?: string[] }
 ): Promise<Record<string, unknown>[]> {
-  const parquetWasm = await getParquetWasm();
+  await ensureWasmInitialized();
 
   // Fetch the file
   const response = await fetch(url);
@@ -143,7 +134,7 @@ async function queryFeatureById(
   featureUrl: string,
   gersId: string
 ): Promise<Record<string, unknown> | null> {
-  const parquetWasm = await getParquetWasm();
+  await ensureWasmInitialized();
 
   // Use ParquetFile for streaming from URL with HTTP range requests
   const parquetFile = await parquetWasm.ParquetFile.fromUrl(featureUrl);

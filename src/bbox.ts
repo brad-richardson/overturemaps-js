@@ -3,12 +3,11 @@
  *
  * Allows fetching features by type within a geographic bounding box,
  * using STAC to discover intersecting files and parquet-wasm for efficient reading.
- *
- * Uses lazy loading for parquet-wasm to minimize bundle size when not using bbox functions.
  */
 
 import { tableFromIPC } from 'apache-arrow';
 import type { Table as ArrowTable, StructRowProxy } from 'apache-arrow';
+import * as parquetWasm from 'parquet-wasm';
 import wkx from 'wkx';
 import { getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, Geometry, OvertureType } from './types.js';
@@ -53,32 +52,22 @@ export interface ReadByBboxOptions {
 }
 
 /**
- * Type for the parquet-wasm module (lazy loaded)
+ * Track WASM initialization state
  */
-type ParquetWasmModule = typeof import('parquet-wasm');
-
-/**
- * Lazy-loaded parquet-wasm module
- */
-let parquetWasmModule: ParquetWasmModule | null = null;
 let wasmInitialized = false;
 
 /**
- * Lazy load and initialize parquet-wasm
+ * Initialize parquet-wasm if needed (for browser environments)
  */
-async function getParquetWasm(): Promise<ParquetWasmModule> {
-  if (!parquetWasmModule) {
-    // Dynamic import for lazy loading - uses node export automatically in Node.js
-    parquetWasmModule = await import('parquet-wasm');
-  }
-
+async function ensureWasmInitialized(): Promise<void> {
   if (!wasmInitialized) {
-    // Initialize WASM - the default export is the init function
-    await parquetWasmModule.default();
+    // In browser environments, we need to call the default init function
+    // In Node.js with the node export, this is already initialized
+    if (typeof parquetWasm.default === 'function') {
+      await parquetWasm.default();
+    }
     wasmInitialized = true;
   }
-
-  return parquetWasmModule;
 }
 
 /**
@@ -100,7 +89,7 @@ function bboxIntersects(a: BoundingBox, b: BoundingBox): boolean {
  * Uses parquet-wasm for consistent handling.
  */
 async function readParquetFromUrl(url: string): Promise<Record<string, unknown>[]> {
-  const parquetWasm = await getParquetWasm();
+  await ensureWasmInitialized();
 
   // For STAC files, we need to fetch the full file since the server may not support range requests
   const response = await fetch(url);
@@ -274,7 +263,7 @@ async function* readFeaturesFromFileStream(
 ): AsyncGenerator<Feature, void, unknown> {
   const url = `${S3_BASE_URL}/${filePath}`;
 
-  const parquetWasm = await getParquetWasm();
+  await ensureWasmInitialized();
 
   // Open the parquet file from URL (uses HTTP range requests)
   const parquetFile = await parquetWasm.ParquetFile.fromUrl(url);
