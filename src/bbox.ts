@@ -181,16 +181,99 @@ export async function getFilesFromStac(
 }
 
 /**
- * Read features from a single parquet file, filtering by bbox.
+ * Convert a parquet row to a GeoJSON Feature.
+ */
+function rowToFeature(row: Record<string, unknown>): Feature | null {
+  // Get geometry (hyparquet automatically converts WKB to GeoJSON for GeoParquet files)
+  const geometry = row.geometry as Geometry | undefined;
+  if (!geometry) {
+    return null; // Skip features without valid geometry
+  }
+
+  // Build properties from all columns except geometry and bbox
+  const properties: Record<string, unknown> = {};
+  for (const key of Object.keys(row)) {
+    if (key !== 'geometry' && key !== 'bbox') {
+      properties[key] = row[key];
+    }
+  }
+
+  // Build the feature
+  const feature: Feature = {
+    type: 'Feature',
+    id: row.id as string | undefined,
+    geometry,
+    properties,
+  };
+
+  // Add bbox if available
+  const rowBbox = row.bbox as {
+    xmin?: number;
+    ymin?: number;
+    xmax?: number;
+    ymax?: number;
+  } | null;
+
+  if (
+    rowBbox &&
+    rowBbox.xmin != null &&
+    rowBbox.ymin != null &&
+    rowBbox.xmax != null &&
+    rowBbox.ymax != null
+  ) {
+    feature.bbox = [rowBbox.xmin, rowBbox.ymin, rowBbox.xmax, rowBbox.ymax];
+  }
+
+  return feature;
+}
+
+/**
+ * Check if a row's bbox intersects with the query bbox.
+ */
+function rowIntersectsBbox(
+  row: Record<string, unknown>,
+  bbox: BoundingBox
+): boolean {
+  const rowBbox = row.bbox as {
+    xmin?: number;
+    ymin?: number;
+    xmax?: number;
+    ymax?: number;
+  } | null;
+
+  // Skip features with incomplete bbox data
+  if (
+    !rowBbox ||
+    rowBbox.xmin == null ||
+    rowBbox.ymin == null ||
+    rowBbox.xmax == null ||
+    rowBbox.ymax == null
+  ) {
+    return false;
+  }
+
+  return bboxIntersects(bbox, {
+    xmin: rowBbox.xmin,
+    ymin: rowBbox.ymin,
+    xmax: rowBbox.xmax,
+    ymax: rowBbox.ymax,
+  });
+}
+
+/**
+ * Read features from a single parquet file incrementally, filtering by bbox.
+ * Processes row groups one at a time to minimize memory usage.
  *
  * @param filePath - Path to the parquet file (relative to S3 bucket)
- * @param bbox - Optional bounding box to filter features
- * @returns Array of features from the file
+ * @param bbox - Bounding box to filter features
+ * @param limit - Maximum number of features to return (optional)
+ * @returns Async generator yielding features from the file
  */
-async function readFeaturesFromFile(
+async function* readFeaturesFromFileIncremental(
   filePath: string,
-  bbox?: BoundingBox
-): Promise<Feature[]> {
+  bbox: BoundingBox,
+  limit?: number
+): AsyncGenerator<Feature, void, unknown> {
   const url = `${S3_BASE_URL}/${filePath}`;
 
   let file: AsyncBuffer;
@@ -205,86 +288,39 @@ async function readFeaturesFromFile(
     );
   }
 
-  // Query all rows from the file
-  const rows = (await parquetQuery({
-    file,
-    metadata,
-    compressors,
-  })) as Record<string, unknown>[];
+  // Process row groups one at a time to minimize memory usage
+  let rowStart = 0;
+  let count = 0;
 
-  const features: Feature[] = [];
+  for (const rowGroup of metadata.row_groups) {
+    const numRows = Number(rowGroup.num_rows);
+    const rowEnd = rowStart + numRows;
 
-  for (const row of rows) {
-    // Extract and validate bbox from the row
-    const rowBbox = row.bbox as {
-      xmin?: number;
-      ymin?: number;
-      xmax?: number;
-      ymax?: number;
-    } | null;
+    // Read only this row group
+    const rows = (await parquetQuery({
+      file,
+      metadata,
+      compressors,
+      rowStart,
+      rowEnd,
+    })) as Record<string, unknown>[];
 
-    // Apply bbox filter if provided
-    if (bbox) {
-      // Skip features with incomplete bbox data
-      if (
-        !rowBbox ||
-        rowBbox.xmin == null ||
-        rowBbox.ymin == null ||
-        rowBbox.xmax == null ||
-        rowBbox.ymax == null
-      ) {
-        continue;
-      }
-
-      const featureBbox: BoundingBox = {
-        xmin: rowBbox.xmin,
-        ymin: rowBbox.ymin,
-        xmax: rowBbox.xmax,
-        ymax: rowBbox.ymax,
-      };
-
-      if (!bboxIntersects(bbox, featureBbox)) {
-        continue;
+    // Filter and yield matching features
+    for (const row of rows) {
+      if (rowIntersectsBbox(row, bbox)) {
+        const feature = rowToFeature(row);
+        if (feature) {
+          yield feature;
+          count++;
+          if (limit !== undefined && count >= limit) {
+            return;
+          }
+        }
       }
     }
 
-    // Build properties from all columns except geometry and bbox
-    const properties: Record<string, unknown> = {};
-    for (const key of Object.keys(row)) {
-      if (key !== 'geometry' && key !== 'bbox') {
-        properties[key] = row[key];
-      }
-    }
-
-    // Get geometry (hyparquet automatically converts WKB to GeoJSON for GeoParquet files)
-    const geometry = row.geometry as Geometry | undefined;
-    if (!geometry) {
-      continue; // Skip features without valid geometry
-    }
-
-    // Build the feature
-    const feature: Feature = {
-      type: 'Feature',
-      id: row.id as string | undefined,
-      geometry,
-      properties,
-    };
-
-    // Add bbox if available
-    if (
-      rowBbox &&
-      rowBbox.xmin != null &&
-      rowBbox.ymin != null &&
-      rowBbox.xmax != null &&
-      rowBbox.ymax != null
-    ) {
-      feature.bbox = [rowBbox.xmin, rowBbox.ymin, rowBbox.xmax, rowBbox.ymax];
-    }
-
-    features.push(feature);
+    rowStart = rowEnd;
   }
-
-  return features;
 }
 
 /**
@@ -350,11 +386,13 @@ export async function* readByBbox(
     return; // No intersecting files found
   }
 
-  // Read features from each file (fail-fast: stops on first error)
+  // Read features from each file incrementally (fail-fast: stops on first error)
   let count = 0;
   for (const filePath of filePaths) {
-    const features = await readFeaturesFromFile(filePath, bbox);
-    for (const feature of features) {
+    // Calculate remaining limit for this file
+    const remainingLimit = limit !== undefined ? limit - count : undefined;
+
+    for await (const feature of readFeaturesFromFileIncremental(filePath, bbox, remainingLimit)) {
       yield feature;
       count++;
       if (limit !== undefined && count >= limit) {
