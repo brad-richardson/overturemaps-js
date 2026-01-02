@@ -5,7 +5,14 @@
  * Works in both browser and Node.js environments.
  */
 
-import { asyncBufferFromUrl, parquetQuery } from 'hyparquet';
+import {
+  asyncBufferFromUrl,
+  cachedAsyncBuffer,
+  parquetMetadataAsync,
+  parquetSchema,
+  parquetQuery,
+} from 'hyparquet';
+import type { AsyncBuffer, FileMetaData } from 'hyparquet';
 import { getStacCatalog, getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types.js';
 
@@ -53,34 +60,32 @@ function binarySearchManifest(manifest: [string, string][], gersId: string): str
 }
 
 /**
- * Read a single row from a Parquet file by ID.
+ * Create a cached AsyncBuffer for a URL.
+ * Uses HTTP range requests and caches fetched byte ranges.
  */
-async function readParquetById<T extends Record<string, unknown>>(
-  url: string,
-  id: string,
-  columns?: string[]
-): Promise<T | null> {
+async function getCachedFile(url: string): Promise<AsyncBuffer> {
   const file = await asyncBufferFromUrl({ url });
-  const rows = await parquetQuery({
-    file,
-    columns,
-    filter: { id: { $eq: id } },
-    rowEnd: 1,
-  }) as T[];
-
-  return rows.length > 0 ? rows[0] : null;
+  return cachedAsyncBuffer(file);
 }
 
 /**
- * Read all column names from a Parquet file schema.
+ * Query a Parquet file by ID, returning the first matching row.
+ * Reuses the provided file buffer and metadata to avoid duplicate fetches.
  */
-async function getParquetColumns(url: string): Promise<string[]> {
-  const { parquetMetadataAsync, parquetSchema } = await import('hyparquet');
-  const file = await asyncBufferFromUrl({ url });
-  const metadata = await parquetMetadataAsync(file);
-  const schema = parquetSchema(metadata);
+async function queryParquetById<T extends Record<string, unknown>>(
+  file: AsyncBuffer,
+  metadata: FileMetaData,
+  id: string,
+  columns?: string[]
+): Promise<T | null> {
+  const rows = (await parquetQuery({
+    file,
+    metadata,
+    columns,
+    filter: { id: { $eq: id } },
+  })) as T[];
 
-  return schema.children.map((child) => child.element.name);
+  return rows.length > 0 ? rows[0] : null;
 }
 
 /**
@@ -102,7 +107,9 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
     catalog = await getStacCatalog();
     release = await getLatestRelease();
   } catch (error) {
-    throw new Error(`Failed to fetch STAC catalog: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Failed to fetch STAC catalog: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 
   if (!catalog.registry) {
@@ -127,7 +134,10 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
   // Query the registry file for this GERS ID
   let row;
   try {
-    row = await readParquetById<{
+    const file = await getCachedFile(registryUrl);
+    const metadata = await parquetMetadataAsync(file);
+
+    row = await queryParquetById<{
       id: string;
       path: string | null;
       bbox: {
@@ -140,9 +150,19 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
       first_seen: string | null;
       last_seen: string | null;
       last_changed: string | null;
-    }>(registryUrl, gersIdLower, ['id', 'path', 'bbox', 'version', 'first_seen', 'last_seen', 'last_changed']);
+    }>(file, metadata, gersIdLower, [
+      'id',
+      'path',
+      'bbox',
+      'version',
+      'first_seen',
+      'last_seen',
+      'last_changed',
+    ]);
   } catch (error) {
-    throw new Error(`Failed to query GERS registry: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Failed to query GERS registry: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 
   if (!row) {
@@ -213,17 +233,28 @@ export async function getFeatureByGersId(
 
   const featureUrl = `${S3_BASE_URL}/${registryResult.filepath}`;
 
-  let columns: string[];
   let row: Record<string, unknown> | null;
   try {
-    // First, get the column names (excluding bbox since we get it from registry)
-    columns = await getParquetColumns(featureUrl);
+    // Create a cached file buffer - reused for metadata and query
+    const file = await getCachedFile(featureUrl);
+    const metadata = await parquetMetadataAsync(file);
+
+    // Get column names from schema (excluding bbox since we get it from registry)
+    const schema = parquetSchema(metadata);
+    const columns = schema.children.map((child) => child.element.name);
     const columnsToRead = columns.filter((name) => name !== 'bbox');
 
-    // Query the feature file
-    row = await readParquetById<Record<string, unknown>>(featureUrl, gersIdLower, columnsToRead);
+    // Query the feature file using the same cached file and metadata
+    row = await queryParquetById<Record<string, unknown>>(
+      file,
+      metadata,
+      gersIdLower,
+      columnsToRead
+    );
   } catch (error) {
-    throw new Error(`Failed to fetch feature: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Failed to fetch feature: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 
   if (!row) {
