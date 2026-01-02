@@ -11,6 +11,7 @@ import {
   parquetMetadataAsync,
   parquetQuery,
 } from 'hyparquet';
+import { compressors } from 'hyparquet-compressors';
 import type { AsyncBuffer, FileMetaData } from 'hyparquet';
 import { getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, Geometry, OvertureType } from './types.js';
@@ -142,6 +143,7 @@ export async function getFilesFromStac(
     file,
     metadata,
     columns: ['collection', 'type', 'bbox', 'assets'],
+    compressors,
   })) as StacCollectionItem[];
 
   // Filter by type and bbox intersection
@@ -207,6 +209,7 @@ async function readFeaturesFromFile(
   const rows = (await parquetQuery({
     file,
     metadata,
+    compressors,
   })) as Record<string, unknown>[];
 
   const features: Feature[] = [];
