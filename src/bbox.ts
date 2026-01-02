@@ -19,6 +19,14 @@ const S3_BASE_URL = 'https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com';
 const STAC_BASE_URL = 'https://stac.overturemaps.org';
 
 /**
+ * Asset entry in the STAC collections.parquet
+ */
+interface StacAsset {
+  href: string;
+  type?: string;
+}
+
+/**
  * STAC collection item structure from collections.parquet
  */
 interface StacCollectionItem {
@@ -30,16 +38,21 @@ interface StacCollectionItem {
     xmax: number;
     ymax: number;
   };
-  assets: string;
+  assets: {
+    'aws-https'?: StacAsset;
+    'aws-s3'?: StacAsset;
+    'azure-https'?: StacAsset;
+    [key: string]: StacAsset | undefined;
+  };
 }
 
 /**
  * Options for readByBbox
- *
- * Currently no options are available; this interface is reserved for future use.
  */
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type
-export interface ReadByBboxOptions {}
+export interface ReadByBboxOptions {
+  /** Maximum number of features to return. If not specified, all features are returned. */
+  limit?: number;
+}
 
 /**
  * Get the collections.parquet URL for a release
@@ -150,11 +163,13 @@ export async function getFilesFromStac(
         ymax: row.bbox.ymax,
       })
     ) {
-      // Extract path from assets (format: s3://bucket/path)
-      const s3Path = row.assets;
-      if (s3Path) {
-        // Convert s3:// URL to HTTPS URL
-        const path = s3Path.replace('s3://overturemaps-us-west-2/', '');
+      // Extract path from assets - prefer aws-https, fall back to aws-s3
+      const asset = row.assets?.['aws-https'] || row.assets?.['aws-s3'];
+      if (asset?.href) {
+        // Convert URL to relative path
+        const path = asset.href
+          .replace('https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com/', '')
+          .replace('s3://overturemaps-us-west-2/', '');
         intersectingFiles.push(path);
       }
     }
@@ -280,7 +295,7 @@ async function readFeaturesFromFile(
  *
  * @param overtureType - The Overture feature type to query
  * @param bbox - Geographic bounding box to filter by
- * @param _options - Reserved for future use
+ * @param options - Optional configuration including limit
  * @returns Async generator yielding features within the bounding box
  * @throws Error if the release cannot be fetched, STAC index fails, or any file read fails
  *
@@ -292,6 +307,11 @@ async function readFeaturesFromFile(
  *   console.log(feature.properties.names);
  * }
  *
+ * // Limit results to first 100 features
+ * for await (const feature of readByBbox('place', bbox, { limit: 100 })) {
+ *   console.log(feature.properties.names);
+ * }
+ *
  * // Or collect all features into an array
  * const features = await Array.fromAsync(readByBbox('building', bbox));
  * ```
@@ -299,8 +319,10 @@ async function readFeaturesFromFile(
 export async function* readByBbox(
   overtureType: OvertureType,
   bbox: BoundingBox,
-  _options: ReadByBboxOptions = {}
+  options: ReadByBboxOptions = {}
 ): AsyncGenerator<Feature, void, unknown> {
+  const { limit } = options;
+
   // Validate bbox
   if (bbox.xmin >= bbox.xmax || bbox.ymin >= bbox.ymax) {
     throw new Error(
@@ -326,10 +348,15 @@ export async function* readByBbox(
   }
 
   // Read features from each file (fail-fast: stops on first error)
+  let count = 0;
   for (const filePath of filePaths) {
     const features = await readFeaturesFromFile(filePath, bbox);
     for (const feature of features) {
       yield feature;
+      count++;
+      if (limit !== undefined && count >= limit) {
+        return; // Reached limit
+      }
     }
   }
 }
@@ -345,7 +372,7 @@ export async function* readByBbox(
  *
  * @param overtureType - The Overture feature type to query
  * @param bbox - Geographic bounding box to filter by
- * @param _options - Reserved for future use
+ * @param options - Optional configuration including limit
  * @returns Promise resolving to array of features within the bounding box
  * @throws Error if the release cannot be fetched, STAC index fails, or any file read fails
  *
@@ -354,15 +381,18 @@ export async function* readByBbox(
  * const bbox = { xmin: -122.5, ymin: 37.7, xmax: -122.3, ymax: 37.9 };
  * const places = await readByBboxAll('place', bbox);
  * console.log(`Found ${places.length} places`);
+ *
+ * // Limit to first 50 features
+ * const limitedPlaces = await readByBboxAll('place', bbox, { limit: 50 });
  * ```
  */
 export async function readByBboxAll(
   overtureType: OvertureType,
   bbox: BoundingBox,
-  _options: ReadByBboxOptions = {}
+  options: ReadByBboxOptions = {}
 ): Promise<Feature[]> {
   const features: Feature[] = [];
-  for await (const feature of readByBbox(overtureType, bbox)) {
+  for await (const feature of readByBbox(overtureType, bbox, options)) {
     features.push(feature);
   }
   return features;
