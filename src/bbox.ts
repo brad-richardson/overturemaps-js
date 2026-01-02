@@ -7,7 +7,6 @@
 
 import { tableFromIPC } from 'apache-arrow';
 import type { Table as ArrowTable, StructRowProxy } from 'apache-arrow';
-import * as parquetWasm from 'parquet-wasm/esm';
 import wkx from 'wkx';
 import { getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, Geometry, OvertureType } from './types.js';
@@ -52,34 +51,35 @@ export interface ReadByBboxOptions {
 }
 
 /**
- * Track WASM initialization state
+ * Cached parquet-wasm module instance
  */
-let wasmInitialized = false;
+let parquetWasmModule: typeof import('parquet-wasm/esm') | null = null;
 
 /**
- * Initialize parquet-wasm
- * In Node.js, we need to load the WASM file from disk since fetch doesn't support file:// URLs.
- * In browsers, the default init fetches it automatically.
+ * Get the parquet-wasm module, loading it appropriately for the environment.
+ *
+ * In Node.js, uses createRequire to load the CJS node export (synchronously loaded, no init).
+ * In browsers, uses the ESM export with explicit initialization.
  */
-async function ensureWasmInitialized(): Promise<void> {
-  if (wasmInitialized) return;
+async function getParquetWasm(): Promise<typeof import('parquet-wasm/esm')> {
+  if (parquetWasmModule) return parquetWasmModule;
 
-  if (typeof parquetWasm.default === 'function') {
-    // Check if we're in Node.js
-    if (typeof process !== 'undefined' && process.versions?.node) {
-      // In Node.js, load WASM from file system using require.resolve
-      const { readFile } = await import('node:fs/promises');
-      const { createRequire } = await import('node:module');
-      const require = createRequire(import.meta.url);
-      const wasmPath = require.resolve('parquet-wasm/esm/parquet_wasm_bg.wasm');
-      const wasmBytes = await readFile(wasmPath);
-      await parquetWasm.default(wasmBytes);
-    } else {
-      // In browser, use default fetch-based initialization
-      await parquetWasm.default();
+  if (typeof process !== 'undefined' && process.versions?.node) {
+    // In Node.js, use createRequire to load the CJS node export
+    // The node export is pre-initialized and doesn't need manual init
+    const { createRequire } = await import('node:module');
+    const require = createRequire(import.meta.url);
+    parquetWasmModule = require('parquet-wasm/node') as typeof import('parquet-wasm/esm');
+  } else {
+    // In browser, use ESM export and initialize
+    const mod = await import('parquet-wasm/esm');
+    if (typeof mod.default === 'function') {
+      await mod.default();
     }
+    parquetWasmModule = mod;
   }
-  wasmInitialized = true;
+
+  return parquetWasmModule;
 }
 
 /**
@@ -101,7 +101,7 @@ function bboxIntersects(a: BoundingBox, b: BoundingBox): boolean {
  * Uses parquet-wasm for consistent handling.
  */
 async function readParquetFromUrl(url: string): Promise<Record<string, unknown>[]> {
-  await ensureWasmInitialized();
+  const parquetWasm = await getParquetWasm();
 
   // For STAC files, we need to fetch the full file since the server may not support range requests
   const response = await fetch(url);
@@ -275,7 +275,7 @@ async function* readFeaturesFromFileStream(
 ): AsyncGenerator<Feature, void, unknown> {
   const url = `${S3_BASE_URL}/${filePath}`;
 
-  await ensureWasmInitialized();
+  const parquetWasm = await getParquetWasm();
 
   // Open the parquet file from URL (uses HTTP range requests)
   const parquetFile = await parquetWasm.ParquetFile.fromUrl(url);
