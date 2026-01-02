@@ -2,17 +2,13 @@
  * Bounding box-based data retrieval for Overture Maps
  *
  * Allows fetching features by type within a geographic bounding box,
- * using STAC to discover intersecting files and hyparquet for efficient reading.
+ * using STAC to discover intersecting files and parquet-wasm for efficient reading.
+ *
+ * Uses lazy loading for parquet-wasm to minimize bundle size when not using bbox functions.
  */
 
-import {
-  asyncBufferFromUrl,
-  cachedAsyncBuffer,
-  parquetMetadataAsync,
-  parquetQuery,
-} from 'hyparquet';
-import { compressors } from 'hyparquet-compressors';
-import type { AsyncBuffer, FileMetaData } from 'hyparquet';
+import { tableFromIPC } from 'apache-arrow';
+import type { Table as ArrowTable, StructRowProxy } from 'apache-arrow';
 import { getLatestRelease } from './stac.js';
 import type { BoundingBox, Feature, Geometry, OvertureType } from './types.js';
 
@@ -56,6 +52,35 @@ export interface ReadByBboxOptions {
 }
 
 /**
+ * Type for the parquet-wasm module (lazy loaded)
+ */
+type ParquetWasmModule = typeof import('parquet-wasm');
+
+/**
+ * Lazy-loaded parquet-wasm module
+ */
+let parquetWasmModule: ParquetWasmModule | null = null;
+let wasmInitialized = false;
+
+/**
+ * Lazy load and initialize parquet-wasm
+ */
+async function getParquetWasm(): Promise<ParquetWasmModule> {
+  if (!parquetWasmModule) {
+    // Dynamic import for lazy loading - uses node export automatically in Node.js
+    parquetWasmModule = await import('parquet-wasm');
+  }
+
+  if (!wasmInitialized) {
+    // Initialize WASM - the default export is the init function
+    await parquetWasmModule.default();
+    wasmInitialized = true;
+  }
+
+  return parquetWasmModule;
+}
+
+/**
  * Get the collections.parquet URL for a release
  */
 function getCollectionsParquetUrl(release: string): string {
@@ -63,46 +88,37 @@ function getCollectionsParquetUrl(release: string): string {
 }
 
 /**
- * Create an AsyncBuffer from a pre-fetched ArrayBuffer.
- * Used for files that need to be fully downloaded (e.g., from servers
- * that don't properly support HTTP range requests).
+ * Check if two bounding boxes intersect
  */
-function asyncBufferFromArrayBuffer(buffer: ArrayBuffer): AsyncBuffer {
-  return {
-    byteLength: buffer.byteLength,
-    slice(start: number, end?: number): Promise<ArrayBuffer> {
-      return Promise.resolve(buffer.slice(start, end));
-    },
-  };
+function bboxIntersects(a: BoundingBox, b: BoundingBox): boolean {
+  return a.xmin < b.xmax && a.xmax > b.xmin && a.ymin < b.ymax && a.ymax > b.ymin;
 }
 
 /**
- * Fetch entire file and create an AsyncBuffer.
- * Used for STAC collections.parquet which may not support range requests properly.
+ * Read a parquet file from URL and return all rows as objects.
+ * Uses parquet-wasm for consistent handling.
  */
-async function fetchFullFile(url: string): Promise<AsyncBuffer> {
+async function readParquetFromUrl(url: string): Promise<Record<string, unknown>[]> {
+  const parquetWasm = await getParquetWasm();
+
+  // For STAC files, we need to fetch the full file since the server may not support range requests
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
   }
   const buffer = await response.arrayBuffer();
-  return asyncBufferFromArrayBuffer(buffer);
-}
 
-/**
- * Create a cached AsyncBuffer for a URL.
- * Uses HTTP range requests and caches fetched byte ranges.
- */
-async function getCachedFile(url: string): Promise<AsyncBuffer> {
-  const file = await asyncBufferFromUrl({ url });
-  return cachedAsyncBuffer(file);
-}
+  // Read parquet data
+  const table = parquetWasm.readParquet(new Uint8Array(buffer));
+  const ipcStream = table.intoIPCStream();
+  const arrowTable: ArrowTable = tableFromIPC(ipcStream);
 
-/**
- * Check if two bounding boxes intersect
- */
-function bboxIntersects(a: BoundingBox, b: BoundingBox): boolean {
-  return a.xmin < b.xmax && a.xmax > b.xmin && a.ymin < b.ymax && a.ymax > b.ymin;
+  // Convert to array of objects
+  const rows: Record<string, unknown>[] = [];
+  for (const row of arrowTable) {
+    rows.push(row.toJSON() as Record<string, unknown>);
+  }
+  return rows;
 }
 
 /**
@@ -124,32 +140,19 @@ export async function getFilesFromStac(
 ): Promise<string[]> {
   const collectionsUrl = getCollectionsParquetUrl(release);
 
-  let file: AsyncBuffer;
-  let metadata: FileMetaData;
-
+  let rows: Record<string, unknown>[];
   try {
-    // Use full file fetch for STAC collections.parquet as the server may not
-    // properly support HTTP range requests
-    file = await fetchFullFile(collectionsUrl);
-    metadata = await parquetMetadataAsync(file);
+    rows = await readParquetFromUrl(collectionsUrl);
   } catch (error) {
     throw new Error(
       `Failed to fetch STAC collections index: ${error instanceof Error ? error.message : String(error)}`
     );
   }
 
-  // Query for items that match our type and intersect with bbox
-  const rows = (await parquetQuery({
-    file,
-    metadata,
-    columns: ['collection', 'type', 'bbox', 'assets'],
-    compressors,
-  })) as StacCollectionItem[];
-
   // Filter by type and bbox intersection
   const intersectingFiles: string[] = [];
 
-  for (const row of rows) {
+  for (const row of rows as unknown as StacCollectionItem[]) {
     // Check if this is a Feature item for our collection type
     if (row.collection !== overtureType || row.type !== 'Feature') {
       continue;
@@ -181,20 +184,66 @@ export async function getFilesFromStac(
 }
 
 /**
- * Convert a parquet row to a GeoJSON Feature.
+ * Convert WKB bytes to GeoJSON geometry
  */
-function rowToFeature(row: Record<string, unknown>): Feature | null {
-  // Get geometry (hyparquet automatically converts WKB to GeoJSON for GeoParquet files)
-  const geometry = row.geometry as Geometry | undefined;
+function wkbToGeoJSON(wkbBytes: Uint8Array): Geometry | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const wkx = require('wkx') as { Geometry: { parse(buffer: Buffer): { toGeoJSON(): object } } };
+    const buffer = Buffer.from(wkbBytes);
+    const geometry = wkx.Geometry.parse(buffer);
+    return geometry.toGeoJSON() as Geometry;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Convert an Arrow row to a GeoJSON Feature
+ */
+function arrowRowToFeature(row: StructRowProxy, queryBbox: BoundingBox): Feature | null {
+  // Get bbox from the row
+  const rowBbox = row.bbox as { xmin?: number; ymin?: number; xmax?: number; ymax?: number } | null;
+
+  // Check bbox intersection
+  if (
+    !rowBbox ||
+    rowBbox.xmin == null ||
+    rowBbox.ymin == null ||
+    rowBbox.xmax == null ||
+    rowBbox.ymax == null
+  ) {
+    return null;
+  }
+
+  if (
+    !bboxIntersects(queryBbox, {
+      xmin: rowBbox.xmin,
+      ymin: rowBbox.ymin,
+      xmax: rowBbox.xmax,
+      ymax: rowBbox.ymax,
+    })
+  ) {
+    return null;
+  }
+
+  // Get geometry (WKB bytes)
+  const geometryBytes = row.geometry as Uint8Array | null;
+  if (!geometryBytes) {
+    return null;
+  }
+
+  const geometry = wkbToGeoJSON(geometryBytes);
   if (!geometry) {
-    return null; // Skip features without valid geometry
+    return null;
   }
 
   // Build properties from all columns except geometry and bbox
   const properties: Record<string, unknown> = {};
-  for (const key of Object.keys(row)) {
+  const rowObj = row.toJSON() as Record<string, unknown>;
+  for (const key of Object.keys(rowObj)) {
     if (key !== 'geometry' && key !== 'bbox') {
-      properties[key] = row[key];
+      properties[key] = rowObj[key];
     }
   }
 
@@ -204,122 +253,66 @@ function rowToFeature(row: Record<string, unknown>): Feature | null {
     id: row.id as string | undefined,
     geometry,
     properties,
+    bbox: [rowBbox.xmin, rowBbox.ymin, rowBbox.xmax, rowBbox.ymax],
   };
-
-  // Add bbox if available
-  const rowBbox = row.bbox as {
-    xmin?: number;
-    ymin?: number;
-    xmax?: number;
-    ymax?: number;
-  } | null;
-
-  if (
-    rowBbox &&
-    rowBbox.xmin != null &&
-    rowBbox.ymin != null &&
-    rowBbox.xmax != null &&
-    rowBbox.ymax != null
-  ) {
-    feature.bbox = [rowBbox.xmin, rowBbox.ymin, rowBbox.xmax, rowBbox.ymax];
-  }
 
   return feature;
 }
 
 /**
- * Check if a row's bbox intersects with the query bbox.
- */
-function rowIntersectsBbox(
-  row: Record<string, unknown>,
-  bbox: BoundingBox
-): boolean {
-  const rowBbox = row.bbox as {
-    xmin?: number;
-    ymin?: number;
-    xmax?: number;
-    ymax?: number;
-  } | null;
-
-  // Skip features with incomplete bbox data
-  if (
-    !rowBbox ||
-    rowBbox.xmin == null ||
-    rowBbox.ymin == null ||
-    rowBbox.xmax == null ||
-    rowBbox.ymax == null
-  ) {
-    return false;
-  }
-
-  return bboxIntersects(bbox, {
-    xmin: rowBbox.xmin,
-    ymin: rowBbox.ymin,
-    xmax: rowBbox.xmax,
-    ymax: rowBbox.ymax,
-  });
-}
-
-/**
- * Read features from a single parquet file incrementally, filtering by bbox.
- * Processes row groups one at a time to minimize memory usage.
+ * Read features from a single parquet file using parquet-wasm streaming.
+ * Yields record batches as they are read, similar to Python's record_batch_reader.
  *
  * @param filePath - Path to the parquet file (relative to S3 bucket)
  * @param bbox - Bounding box to filter features
- * @param limit - Maximum number of features to return (optional)
+ * @param limit - Optional limit on number of rows to read from parquet
  * @returns Async generator yielding features from the file
  */
-async function* readFeaturesFromFileIncremental(
+async function* readFeaturesFromFileStream(
   filePath: string,
   bbox: BoundingBox,
   limit?: number
 ): AsyncGenerator<Feature, void, unknown> {
   const url = `${S3_BASE_URL}/${filePath}`;
 
-  let file: AsyncBuffer;
-  let metadata: FileMetaData;
+  const parquetWasm = await getParquetWasm();
+
+  // Open the parquet file from URL (uses HTTP range requests)
+  const parquetFile = await parquetWasm.ParquetFile.fromUrl(url);
 
   try {
-    file = await getCachedFile(url);
-    metadata = await parquetMetadataAsync(file);
-  } catch (error) {
-    throw new Error(
-      `Failed to read parquet file ${filePath}: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
+    // Get a stream of record batches
+    const stream = await parquetFile.stream({
+      batchSize: 1024, // Process 1024 rows at a time
+      concurrency: 4, // Concurrent HTTP requests
+      limit, // Native limit support in parquet-wasm
+    });
 
-  // Process row groups one at a time to minimize memory usage
-  let rowStart = 0;
-  let count = 0;
+    // Use reader to iterate over the stream (ReadableStream doesn't have async iterator in all environments)
+    const reader = stream.getReader();
+    try {
+      while (true) {
+        const { done, value: wasmRecordBatch } = await reader.read();
+        if (done) break;
 
-  for (const rowGroup of metadata.row_groups) {
-    const numRows = Number(rowGroup.num_rows);
-    const rowEnd = rowStart + numRows;
+        // Convert WASM RecordBatch to Arrow JS Table
+        const ipcStream = wasmRecordBatch.intoIPCStream();
+        const arrowTable: ArrowTable = tableFromIPC(ipcStream);
 
-    // Read only this row group
-    const rows = (await parquetQuery({
-      file,
-      metadata,
-      compressors,
-      rowStart,
-      rowEnd,
-    })) as Record<string, unknown>[];
-
-    // Filter and yield matching features
-    for (const row of rows) {
-      if (rowIntersectsBbox(row, bbox)) {
-        const feature = rowToFeature(row);
-        if (feature) {
-          yield feature;
-          count++;
-          if (limit !== undefined && count >= limit) {
-            return;
+        // Iterate through rows in the batch
+        for (const row of arrowTable) {
+          const feature = arrowRowToFeature(row, bbox);
+          if (feature) {
+            yield feature;
           }
         }
       }
+    } finally {
+      reader.releaseLock();
     }
-
-    rowStart = rowEnd;
+  } finally {
+    // Clean up WASM resources
+    parquetFile.free();
   }
 }
 
@@ -327,7 +320,7 @@ async function* readFeaturesFromFileIncremental(
  * Read Overture features by type within a bounding box.
  *
  * This function discovers relevant parquet files using the STAC index,
- * then reads and filters features that intersect with the given bounding box.
+ * then streams record batches from each file, similar to Python's record_batch_reader.
  *
  * Note: This function uses fail-fast error handling. If reading any file fails,
  * the entire operation stops and throws an error. Partial results are not returned.
@@ -386,13 +379,13 @@ export async function* readByBbox(
     return; // No intersecting files found
   }
 
-  // Read features from each file incrementally (fail-fast: stops on first error)
+  // Stream features from each file
   let count = 0;
   for (const filePath of filePaths) {
     // Calculate remaining limit for this file
     const remainingLimit = limit !== undefined ? limit - count : undefined;
 
-    for await (const feature of readFeaturesFromFileIncremental(filePath, bbox, remainingLimit)) {
+    for await (const feature of readFeaturesFromFileStream(filePath, bbox, remainingLimit)) {
       yield feature;
       count++;
       if (limit !== undefined && count >= limit) {

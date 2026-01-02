@@ -77,8 +77,8 @@ describe('Bounding Box Queries', () => {
       }).rejects.toThrow('Invalid bounding box');
     });
 
-    // Note: This is an integration test that loads actual parquet data.
-    // Uses a tiny bbox and limit option to control memory usage.
+    // Note: This is an integration test that streams actual parquet data.
+    // Uses a tiny bbox and limit option to minimize data transfer.
     it('should yield features for a small bbox', async () => {
       // Tiny bbox - approximately 50m x 50m in San Francisco (single city block)
       const bbox: BoundingBox = {
@@ -105,8 +105,8 @@ describe('Bounding Box Queries', () => {
   });
 
   describe('readByBboxAll', () => {
-    // Note: This is an integration test that loads actual parquet data.
-    // Uses a tiny bbox and limit option to control memory usage.
+    // Note: This is an integration test that streams actual parquet data.
+    // Uses a tiny bbox and limit option to minimize data transfer.
     it('should return all features as an array', async () => {
       // Tiny bbox - approximately 50m x 50m in San Francisco (single city block)
       const bbox: BoundingBox = {
@@ -116,7 +116,7 @@ describe('Bounding Box Queries', () => {
         ymax: 37.7754,
       };
 
-      // Use limit to prevent loading too much data and running out of memory
+      // Use limit to prevent loading too much data
       const features = await readByBboxAll('place', bbox, { limit: 1 });
 
       expect(Array.isArray(features)).toBe(true);
