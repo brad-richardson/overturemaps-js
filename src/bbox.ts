@@ -57,17 +57,29 @@ export interface ReadByBboxOptions {
 let wasmInitialized = false;
 
 /**
- * Initialize parquet-wasm if needed (for browser environments)
+ * Initialize parquet-wasm
+ * In Node.js, we need to load the WASM file from disk since fetch doesn't support file:// URLs.
+ * In browsers, the default init fetches it automatically.
  */
 async function ensureWasmInitialized(): Promise<void> {
-  if (!wasmInitialized) {
-    // In browser environments, we need to call the default init function
-    // In Node.js with the node export, this is already initialized
-    if (typeof parquetWasm.default === 'function') {
+  if (wasmInitialized) return;
+
+  if (typeof parquetWasm.default === 'function') {
+    // Check if we're in Node.js
+    if (typeof process !== 'undefined' && process.versions?.node) {
+      // In Node.js, load WASM from file system using require.resolve
+      const { readFile } = await import('node:fs/promises');
+      const { createRequire } = await import('node:module');
+      const require = createRequire(import.meta.url);
+      const wasmPath = require.resolve('parquet-wasm/esm/parquet_wasm_bg.wasm');
+      const wasmBytes = await readFile(wasmPath);
+      await parquetWasm.default(wasmBytes);
+    } else {
+      // In browser, use default fetch-based initialization
       await parquetWasm.default();
     }
-    wasmInitialized = true;
   }
+  wasmInitialized = true;
 }
 
 /**
