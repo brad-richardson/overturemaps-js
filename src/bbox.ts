@@ -2,17 +2,18 @@
  * Bounding box-based data retrieval for Overture Maps
  *
  * Allows fetching features by type within a geographic bounding box,
- * using STAC to discover intersecting files and parquet-wasm for efficient reading.
+ * using STAC to discover intersecting files. Prefers DuckDB-WASM for efficient
+ * predicate pushdown queries when available, falls back to parquet-wasm.
  */
 
 import { tableFromIPC } from 'apache-arrow';
 import type { Table as ArrowTable, StructRowProxy } from 'apache-arrow';
-import wkx from 'wkx';
+import { S3_BASE_URL, STAC_BASE_URL } from './constants.js';
+import { isDuckDBAvailable, queryParquetWithBbox } from './duckdb.js';
+import { getParquetWasm, readParquetFromUrl } from './parquet.js';
 import { getLatestRelease } from './stac.js';
-import type { BoundingBox, Feature, Geometry, OvertureType } from './types.js';
-
-const S3_BASE_URL = 'https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com';
-const STAC_BASE_URL = 'https://stac.overturemaps.org';
+import type { BoundingBox, Feature, OvertureType } from './types.js';
+import { wkbToGeoJSON } from './wkb.js';
 
 /**
  * Asset entry in the STAC collections.parquet
@@ -51,38 +52,6 @@ export interface ReadByBboxOptions {
 }
 
 /**
- * Cached parquet-wasm module instance
- */
-let parquetWasmModule: typeof import('parquet-wasm/esm') | null = null;
-
-/**
- * Get the parquet-wasm module, loading it appropriately for the environment.
- *
- * In Node.js, uses createRequire to load the CJS node export (synchronously loaded, no init).
- * In browsers, uses the ESM export with explicit initialization.
- */
-async function getParquetWasm(): Promise<typeof import('parquet-wasm/esm')> {
-  if (parquetWasmModule) return parquetWasmModule;
-
-  if (typeof process !== 'undefined' && process.versions?.node) {
-    // In Node.js, use createRequire to load the CJS node export
-    // The node export is pre-initialized and doesn't need manual init
-    const { createRequire } = await import('node:module');
-    const require = createRequire(import.meta.url);
-    parquetWasmModule = require('parquet-wasm/node') as typeof import('parquet-wasm/esm');
-  } else {
-    // In browser, use ESM export and initialize
-    const mod = await import('parquet-wasm/esm');
-    if (typeof mod.default === 'function') {
-      await mod.default();
-    }
-    parquetWasmModule = mod;
-  }
-
-  return parquetWasmModule;
-}
-
-/**
  * Get the collections.parquet URL for a release
  */
 function getCollectionsParquetUrl(release: string): string {
@@ -94,33 +63,6 @@ function getCollectionsParquetUrl(release: string): string {
  */
 function bboxIntersects(a: BoundingBox, b: BoundingBox): boolean {
   return a.xmin < b.xmax && a.xmax > b.xmin && a.ymin < b.ymax && a.ymax > b.ymin;
-}
-
-/**
- * Read a parquet file from URL and return all rows as objects.
- * Uses parquet-wasm for consistent handling.
- */
-async function readParquetFromUrl(url: string): Promise<Record<string, unknown>[]> {
-  const parquetWasm = await getParquetWasm();
-
-  // For STAC files, we need to fetch the full file since the server may not support range requests
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
-  }
-  const buffer = await response.arrayBuffer();
-
-  // Read parquet data
-  const table = parquetWasm.readParquet(new Uint8Array(buffer));
-  const ipcStream = table.intoIPCStream();
-  const arrowTable: ArrowTable = tableFromIPC(ipcStream);
-
-  // Convert to array of objects
-  const rows: Record<string, unknown>[] = [];
-  for (const row of arrowTable) {
-    rows.push(row.toJSON() as Record<string, unknown>);
-  }
-  return rows;
 }
 
 /**
@@ -186,15 +128,64 @@ export async function getFilesFromStac(
 }
 
 /**
- * Convert WKB bytes to GeoJSON geometry
+ * Convert a DuckDB row to a GeoJSON Feature
  */
-function wkbToGeoJSON(wkbBytes: Uint8Array): Geometry | null {
-  try {
-    const buffer = Buffer.from(wkbBytes);
-    const geometry = wkx.Geometry.parse(buffer);
-    return geometry.toGeoJSON() as Geometry;
-  } catch {
+function duckdbRowToFeature(row: Record<string, unknown>): Feature | null {
+  // Get bbox from the row
+  const rowBbox = row.bbox as { xmin?: number; ymin?: number; xmax?: number; ymax?: number } | null;
+
+  // Get geometry (WKB bytes)
+  const geometryBytes = row.geometry as Uint8Array | null;
+  if (!geometryBytes) {
     return null;
+  }
+
+  const geometry = wkbToGeoJSON(geometryBytes);
+  if (!geometry) {
+    return null;
+  }
+
+  // Build properties from all columns except geometry and bbox
+  const properties: Record<string, unknown> = {};
+  for (const key of Object.keys(row)) {
+    if (key !== 'geometry' && key !== 'bbox') {
+      properties[key] = row[key];
+    }
+  }
+
+  // Build the feature
+  const feature: Feature = {
+    type: 'Feature',
+    id: row.id as string | undefined,
+    geometry,
+    properties,
+    bbox:
+      rowBbox && rowBbox.xmin != null && rowBbox.ymin != null && rowBbox.xmax != null && rowBbox.ymax != null
+        ? [rowBbox.xmin, rowBbox.ymin, rowBbox.xmax, rowBbox.ymax]
+        : undefined,
+  };
+
+  return feature;
+}
+
+/**
+ * Read features from a parquet file using DuckDB-WASM with predicate pushdown.
+ * This is significantly faster for bbox queries as it only reads relevant row groups.
+ */
+async function* readFeaturesFromFileDuckDB(
+  filePath: string,
+  bbox: BoundingBox,
+  limit?: number
+): AsyncGenerator<Feature, void, unknown> {
+  const url = `${S3_BASE_URL}/${filePath}`;
+
+  const rows = await queryParquetWithBbox(url, bbox, { limit });
+
+  for (const row of rows) {
+    const feature = duckdbRowToFeature(row);
+    if (feature) {
+      yield feature;
+    }
   }
 }
 
@@ -355,10 +346,17 @@ export async function* readByBbox(
 ): AsyncGenerator<Feature, void, unknown> {
   const { limit } = options;
 
-  // Validate bbox
+  // Validate bbox order
   if (bbox.xmin >= bbox.xmax || bbox.ymin >= bbox.ymax) {
     throw new Error(
       'Invalid bounding box: xmin must be less than xmax, ymin must be less than ymax'
+    );
+  }
+
+  // Validate geographic range
+  if (bbox.xmin < -180 || bbox.xmax > 180 || bbox.ymin < -90 || bbox.ymax > 90) {
+    throw new Error(
+      'Bounding box coordinates out of valid geographic range (longitude: -180 to 180, latitude: -90 to 90)'
     );
   }
 
@@ -379,13 +377,21 @@ export async function* readByBbox(
     return; // No intersecting files found
   }
 
+  // Check if DuckDB is available for faster predicate pushdown queries
+  const useDuckDB = await isDuckDBAvailable();
+
   // Stream features from each file
   let count = 0;
   for (const filePath of filePaths) {
     // Calculate remaining limit for this file
     const remainingLimit = limit !== undefined ? limit - count : undefined;
 
-    for await (const feature of readFeaturesFromFileStream(filePath, bbox, remainingLimit)) {
+    // Use DuckDB if available, otherwise fall back to parquet-wasm
+    const featureGenerator = useDuckDB
+      ? readFeaturesFromFileDuckDB(filePath, bbox, remainingLimit)
+      : readFeaturesFromFileStream(filePath, bbox, remainingLimit);
+
+    for await (const feature of featureGenerator) {
       yield feature;
       count++;
       if (limit !== undefined && count >= limit) {

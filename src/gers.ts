@@ -1,52 +1,22 @@
 /**
  * GERS (Global Entity Reference System) lookup functionality
  *
- * Provides efficient lookup of Overture features by their GERS ID using parquet-wasm.
+ * Provides efficient lookup of Overture features by their GERS ID.
+ * Prefers DuckDB-WASM for predicate pushdown when available, falls back to parquet-wasm.
  * Works in both browser and Node.js environments.
  */
 
 import { tableFromIPC } from 'apache-arrow';
 import type { Table as ArrowTable } from 'apache-arrow';
-import wkx from 'wkx';
+import { S3_BASE_URL } from './constants.js';
+import { isDuckDBAvailable, queryParquetById } from './duckdb.js';
+import { getParquetWasm, readParquetFromUrl } from './parquet.js';
 import { getStacCatalog, getLatestRelease } from './stac.js';
-import type { BoundingBox, Feature, GersRegistryResult, Geometry } from './types.js';
-
-const S3_BASE_URL = 'https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com';
+import type { BoundingBox, Feature, GersRegistryResult } from './types.js';
+import { wkbToGeoJSON } from './wkb.js';
 
 // UUID v4 format validation regex
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/**
- * Cached parquet-wasm module instance
- */
-let parquetWasmModule: typeof import('parquet-wasm/esm') | null = null;
-
-/**
- * Get the parquet-wasm module, loading it appropriately for the environment.
- *
- * In Node.js, uses createRequire to load the CJS node export (synchronously loaded, no init).
- * In browsers, uses the ESM export with explicit initialization.
- */
-async function getParquetWasm(): Promise<typeof import('parquet-wasm/esm')> {
-  if (parquetWasmModule) return parquetWasmModule;
-
-  if (typeof process !== 'undefined' && process.versions?.node) {
-    // In Node.js, use createRequire to load the CJS node export
-    // The node export is pre-initialized and doesn't need manual init
-    const { createRequire } = await import('node:module');
-    const require = createRequire(import.meta.url);
-    parquetWasmModule = require('parquet-wasm/node') as typeof import('parquet-wasm/esm');
-  } else {
-    // In browser, use ESM export and initialize
-    const mod = await import('parquet-wasm/esm');
-    if (typeof mod.default === 'function') {
-      await mod.default();
-    }
-    parquetWasmModule = mod;
-  }
-
-  return parquetWasmModule;
-}
 
 /**
  * Validate that a string is a valid GERS ID (UUID format).
@@ -87,41 +57,20 @@ function binarySearchManifest(manifest: [string, string][], gersId: string): str
 }
 
 /**
- * Read a parquet file from URL and return all rows as objects.
+ * Query the registry file for a specific GERS ID using DuckDB (predicate pushdown).
  */
-async function readParquetFromUrl(
-  url: string,
-  options?: { columns?: string[] }
-): Promise<Record<string, unknown>[]> {
-  const parquetWasm = await getParquetWasm();
-
-  // Fetch the file
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
-  }
-  const buffer = await response.arrayBuffer();
-
-  // Read parquet data with options
-  const table = parquetWasm.readParquet(new Uint8Array(buffer), {
-    columns: options?.columns,
-  });
-  const ipcStream = table.intoIPCStream();
-  const arrowTable: ArrowTable = tableFromIPC(ipcStream);
-
-  // Convert to array of objects
-  const rows: Record<string, unknown>[] = [];
-  for (const row of arrowTable) {
-    rows.push(row.toJSON() as Record<string, unknown>);
-  }
-  return rows;
+async function queryRegistryByIdDuckDB(
+  registryUrl: string,
+  gersId: string
+): Promise<Record<string, unknown> | null> {
+  return queryParquetById(registryUrl, gersId, 'id');
 }
 
 /**
- * Query the registry file for a specific GERS ID.
+ * Query the registry file for a specific GERS ID using parquet-wasm (fallback).
  * Returns the first matching row.
  */
-async function queryRegistryById(
+async function queryRegistryByIdParquet(
   registryUrl: string,
   gersId: string
 ): Promise<Record<string, unknown> | null> {
@@ -139,10 +88,20 @@ async function queryRegistryById(
 }
 
 /**
- * Query the feature file for a specific GERS ID using streaming.
+ * Query the feature file for a specific GERS ID using DuckDB (predicate pushdown).
+ */
+async function queryFeatureByIdDuckDB(
+  featureUrl: string,
+  gersId: string
+): Promise<Record<string, unknown> | null> {
+  return queryParquetById(featureUrl, gersId, 'id');
+}
+
+/**
+ * Query the feature file for a specific GERS ID using parquet-wasm streaming (fallback).
  * Uses HTTP range requests for efficient access to remote files.
  */
-async function queryFeatureById(
+async function queryFeatureByIdParquet(
   featureUrl: string,
   gersId: string
 ): Promise<Record<string, unknown> | null> {
@@ -191,19 +150,6 @@ async function queryFeatureById(
 }
 
 /**
- * Convert WKB bytes to GeoJSON geometry
- */
-function wkbToGeoJSON(wkbBytes: Uint8Array): Geometry | null {
-  try {
-    const buffer = Buffer.from(wkbBytes);
-    const geometry = wkx.Geometry.parse(buffer);
-    return geometry.toGeoJSON() as Geometry;
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Query the GERS registry to get metadata for a given GERS ID.
  *
  * @param gersId - The GERS ID to look up (UUID format)
@@ -246,10 +192,15 @@ export async function queryGersRegistry(gersId: string): Promise<GersRegistryRes
 
   const registryUrl = `${S3_BASE_URL}/registry/${registryFile}`;
 
+  // Check if DuckDB is available for faster predicate pushdown queries
+  const useDuckDB = await isDuckDBAvailable();
+
   // Query the registry file for this GERS ID
   let row: Record<string, unknown> | null;
   try {
-    row = await queryRegistryById(registryUrl, gersIdLower);
+    row = useDuckDB
+      ? await queryRegistryByIdDuckDB(registryUrl, gersIdLower)
+      : await queryRegistryByIdParquet(registryUrl, gersIdLower);
   } catch (error) {
     throw new Error(
       `Failed to query GERS registry: ${error instanceof Error ? error.message : String(error)}`
@@ -325,9 +276,14 @@ export async function getFeatureByGersId(
 
   const featureUrl = `${S3_BASE_URL}/${registryResult.filepath}`;
 
+  // Check if DuckDB is available for faster predicate pushdown queries
+  const useDuckDB = await isDuckDBAvailable();
+
   let row: Record<string, unknown> | null;
   try {
-    row = await queryFeatureById(featureUrl, gersIdLower);
+    row = useDuckDB
+      ? await queryFeatureByIdDuckDB(featureUrl, gersIdLower)
+      : await queryFeatureByIdParquet(featureUrl, gersIdLower);
   } catch (error) {
     throw new Error(
       `Failed to fetch feature: ${error instanceof Error ? error.message : String(error)}`
@@ -374,10 +330,14 @@ export async function getFeatureByGersId(
 }
 
 /**
- * Close resources (no-op for parquet-wasm, kept for API compatibility).
- * @deprecated This function is no longer needed with parquet-wasm.
+ * Close resources. Closes DuckDB connection if one was created.
  */
 export async function closeDb(): Promise<void> {
-  // No persistent connection to close with parquet-wasm
-  // Kept for backwards API compatibility
+  // Import dynamically to avoid issues if duckdb is not installed
+  try {
+    const { closeDuckDB } = await import('./duckdb.js');
+    await closeDuckDB();
+  } catch {
+    // DuckDB not available or not initialized, nothing to close
+  }
 }
