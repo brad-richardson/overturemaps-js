@@ -1,18 +1,19 @@
 {
   "name": "@bradrichardson/overturemaps",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Unofficial JavaScript/TypeScript client for Overture Maps Foundation data - inspired by overturemaps-py",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "./dist/index.cjs",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
       "types": "./dist/index.d.ts"
     }
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean --external parquet-wasm,@duckdb/duckdb-wasm",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src/**/*.ts",
@@ -64,6 +65,7 @@
     "@types/node": "^20.10.0",
     "eslint": "^9.39.2",
     "jsdom": "^27.4.0",
+    "tsup": "^8.5.1",
     "typescript": "^5.3.0",
     "typescript-eslint": "^8.51.0",
     "vitest": "^4.0.0"
@@ -75,5 +77,6 @@
     "@duckdb/duckdb-wasm": {
       "optional": true
     }
-  }
+  },
+  "module": "./dist/index.js"
 }
